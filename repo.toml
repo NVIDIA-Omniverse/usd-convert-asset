@@ -1,0 +1,164 @@
+[repo]
+name = "usd_convert_asset"
+
+
+[repo.tokens]
+version = "${file:${root}/VERSION.md}"
+usd_flavor = "usd"
+usd_ver = "25.11"
+python_ver = "3.12"
+abi = "2.35"
+
+# Windows doesn't need abi configured. This is required to build with repo_man 2.3.1
+"platform:windows-x86_64".abi = ""
+
+[repo.folders]
+version_file = "${root}/VERSION.md"
+
+########################################################################################################################
+# Substitution
+########################################################################################################################
+
+[repo_subst]
+enabled = true
+files = [
+    ["${root}/source/python/templates/pyproject.toml", "${root}/source/python/pyproject.toml"],
+    ["${root}/source/python/templates/_version.py", "${root}/source/python/usd_convert_asset/_version.py"],
+]
+
+[repo_build]
+msbuild.link_host_toolchain = true
+msbuild.sln_file = "${conf:repo.name}.sln"
+msbuild.vs_version = "" #leave empty to use latest version on local machine
+
+# Disable licensing gathering for Conan pip package since we already have its license in third party licenses
+fetch.pip.licensing_enabled = false
+
+
+fetch.before_pull_commands = [
+    [
+        "$root/repo${shell_ext}",
+        "subst",
+    ],
+    [
+        "$root/repo${shell_ext}",
+        "usd",
+        "--generate-usd-deps",
+        "--usd-flavor", "${usd_flavor}",
+        "--usd-ver", "${usd_ver}",
+        "--python-ver", "${python_ver}",
+    ],
+]
+
+
+fetch.after_pull_commands = [
+    [
+        "$root/_build/target-deps/python/python${exe_ext}",
+        "$root/tools/conan/conan_deps.py",
+        "--config", "${config}",
+    ],
+]
+
+########################################################################################################################
+# CI Entry points (scripts)
+########################################################################################################################
+
+
+
+
+[[repo_build.argument]]
+name = "usd_flavor"
+help = "Set the USD flavor to build against"
+extra_premake_args = ["--usd-flavor=${usd_flavor}"]
+
+[[repo_build.argument]]
+name = "usd_version"
+help = "Set the USD version to build against"
+extra_premake_args = ["--usd-ver=${usd_ver}"]
+
+[[repo_build.argument]]
+name = "python_ver"
+help = "Set the python version to build against"
+extra_premake_args = ["--python-ver=${python_ver}"]
+
+
+
+[repo_test.python_executable]
+python_executable_path = "${root}/_build/target-deps/python/python${exe_ext}"
+
+[repo_test]
+default_config = "release"
+default_suite = "all"
+max_parallel_processes = 1
+test_root = "${root}/_build/${platform}/${config}"
+archive_pattern = "$root/_build/packages/*.$config.7z"
+library_paths = [
+    "${test_root}/bin",
+    # test from _build
+    "${test_root}/python/asset_converter_native_bindings/libs",
+    # test from package
+    "${test_root}/asset_converter_native_bindings/libs",
+    "${root}/_build/target-deps/usd/${config}/lib",
+    "${root}/_build/target-deps/usd/${config}/bin",
+    "${root}/_build/target-deps/python",
+    "${root}/_build/target-deps/python/lib"
+]
+python_paths = [
+    "${test_root}",
+    "${test_root}/python",
+    "${root}/_build/target-deps/omni_asset_validator/python",
+    "${root}/_build/target-deps/usd/${config}/lib/python",
+    "${root}/_build/target-deps/usd/${config}/python",
+]
+env_vars = [
+  [ "CARB_APP_PATH", "${test_root}" ],
+  [ "REPO_ROOT_PATH", "${root}" ],
+  [ "PXR_PLUGINPATH_NAME", "${test_root}/python/asset_converter_native_bindings/libs/resources" ],
+]
+
+[repo_test.suites.python]
+kind = "unittest"
+log_file = "_build/unittest/results.xml"
+discover_path = "${root}/source/tests/python"
+
+[repo_test.suites.cpp]
+kind = "catch2"
+tests_per_process = 0
+executables = [
+    "${root}/_build/${platform}/${config}/bin/test_suite${exe_ext}",
+]
+
+
+[repo_build.premake]
+"token:abi==2.35".linux_x86_64_cxx_abi=true
+
+[repo_build.docker]
+enabled = false
+
+
+[[repo_build.argument]]
+name = "--usd-flavor"
+help = "Flavor of OpenUSD to use"
+kwargs.choices = [
+    "usd",
+]
+kwargs.nargs = 1
+kwargs.default = "usd"
+kwargs.dest = "usd_flavor"
+
+[[repo_build.argument]]
+name = "--usd-ver"
+help = "Version of the OpenUSD flavor to use in the format x.y"
+kwargs.nargs = 1
+kwargs.default = "24.05"
+kwargs.dest = "usd_ver"
+
+[[repo_build.argument]]
+name = "--python-ver"
+help = "Version of Python compatible with selected OpenUSD flavor and version"
+kwargs.nargs = 1
+kwargs.default = "3.11"
+kwargs.dest = "python_ver"
+
+
+

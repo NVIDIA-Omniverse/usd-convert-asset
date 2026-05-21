@@ -1,0 +1,5 @@
+[repo_subst]
+enabled = true
+command = "subst"
+entry_point = "repo_subst:setup_repo_tool"
+files = []

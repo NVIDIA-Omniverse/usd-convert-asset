@@ -1,0 +1,6 @@
+<project toolsVersion="5.0">
+
+  <dependency name="premake" linkPath="../_build/host-deps/premake" tags="non-redist">
+      <package name="premake" version="5.0.0-beta2+nv1-${platform}" />
+  </dependency>
+</project>

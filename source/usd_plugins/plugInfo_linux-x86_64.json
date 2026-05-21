@@ -1,0 +1,32 @@
+{
+    "Plugins": [
+        {
+            "Info": {
+                "Types": {
+                    "OmniAssetFileFormat": {
+                        "bases": [
+                            "SdfFileFormat"
+                        ],
+                        "displayName": "Omniverse Asset File Format",
+                        "extensions": [
+                            "fbx",
+                            "obj",
+                            "gltf",
+                            "glb",
+                            "md5",
+                            "lxo"
+                        ],
+                        "formatId": "omniasset",
+                        "primary": true,
+                        "target": "usd"
+                    }
+                }
+            },
+            "LibraryPath": "./libusd_convert_asset_usd_plugin.so",
+            "Name": "OmniAsset",
+            "ResourcePath": "resources",
+            "Root": "..",
+            "Type": "library"
+        }
+    ]
+}

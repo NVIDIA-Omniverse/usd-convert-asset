@@ -1,0 +1,210 @@
+diff --git a/code/AssetLib/Obj/ObjExporter.cpp b/code/AssetLib/Obj/ObjExporter.cpp
+index 7c5c051..cefd6e0 100644
+--- a/code/AssetLib/Obj/ObjExporter.cpp
++++ b/code/AssetLib/Obj/ObjExporter.cpp
+@@ -174,9 +174,16 @@ void ObjExporter::WriteHeader(std::ostringstream& out) {
+ 
+ // ------------------------------------------------------------------------------------------------
+ std::string ObjExporter::GetMaterialName(unsigned int index) {
++    static const std::string EmptyStr;
++    // #NV Omniverse
++    if (index >= pScene->mNumMaterials)
++    {
++        return EmptyStr;
++    }
++    // #END NV Omniverse
++
+     const aiMaterial* const mat = pScene->mMaterials[index];
+     if ( nullptr == mat ) {
+-        static const std::string EmptyStr;
+         return EmptyStr;
+     }
+ 
+@@ -304,7 +311,7 @@ void ObjExporter::WriteGeometryFile(bool noMtl, bool merge_identical_vertices) {
+         if (!m.name.empty()) {
+             mOutput << "g " << m.name << endl;
+         }
+-        if ( !noMtl ) {
++        if ( !noMtl && !m.matname.empty() ) {
+             mOutput << "usemtl " << m.matname << endl;
+         }
+ 
+diff --git a/code/AssetLib/Obj/ObjFileData.h b/code/AssetLib/Obj/ObjFileData.h
+index 205c855..bc7a5f2 100644
+--- a/code/AssetLib/Obj/ObjFileData.h
++++ b/code/AssetLib/Obj/ObjFileData.h
+@@ -168,6 +168,9 @@ struct Material {
+     aiColor3D diffuse;
+     //! Specular color
+     aiColor3D specular;
++//#nv begin #omniverse
++    bool hasEmissive = false;
++//#nv end
+     //! Emissive color
+     aiColor3D emissive;
+     //! Alpha value
+diff --git a/code/AssetLib/Obj/ObjFileImporter.cpp b/code/AssetLib/Obj/ObjFileImporter.cpp
+index 09aa84c..63216b0 100644
+--- a/code/AssetLib/Obj/ObjFileImporter.cpp
++++ b/code/AssetLib/Obj/ObjFileImporter.cpp
+@@ -619,7 +619,8 @@ void ObjFileImporter::createMaterials(const ObjFile::Model *pModel, aiScene *pSc
+         mat->AddProperty(&pCurrentMaterial->ambient, 1, AI_MATKEY_COLOR_AMBIENT);
+         mat->AddProperty(&pCurrentMaterial->diffuse, 1, AI_MATKEY_COLOR_DIFFUSE);
+         mat->AddProperty(&pCurrentMaterial->specular, 1, AI_MATKEY_COLOR_SPECULAR);
+-        mat->AddProperty(&pCurrentMaterial->emissive, 1, AI_MATKEY_COLOR_EMISSIVE);
++        if (pCurrentMaterial->hasEmissive)
++            mat->AddProperty(&pCurrentMaterial->emissive, 1, AI_MATKEY_COLOR_EMISSIVE);
+         mat->AddProperty(&pCurrentMaterial->shineness, 1, AI_MATKEY_SHININESS);
+         mat->AddProperty(&pCurrentMaterial->alpha, 1, AI_MATKEY_OPACITY);
+         mat->AddProperty(&pCurrentMaterial->transparent, 1, AI_MATKEY_COLOR_TRANSPARENT);
+diff --git a/code/AssetLib/Obj/ObjFileMtlImporter.cpp b/code/AssetLib/Obj/ObjFileMtlImporter.cpp
+index effdf62..4744040 100644
+--- a/code/AssetLib/Obj/ObjFileMtlImporter.cpp
++++ b/code/AssetLib/Obj/ObjFileMtlImporter.cpp
+@@ -137,8 +137,10 @@ void ObjFileMtlImporter::load() {
+                         getColorRGBA(&m_pModel->mCurrentMaterial->specular);
+                 } else if (*m_DataIt == 'e') {
+                     ++m_DataIt;
+-                    if (m_pModel->mCurrentMaterial != nullptr)
++                    if (m_pModel->mCurrentMaterial != nullptr) {
++                        m_pModel->mCurrentMaterial->hasEmissive = true;
+                         getColorRGBA(&m_pModel->mCurrentMaterial->emissive);
++                    }
+                 }
+                 m_DataIt = skipLine<DataArrayIt>(m_DataIt, m_DataItEnd, m_uiLine);
+             } break;
+diff --git a/code/AssetLib/Obj/ObjFileParser.cpp b/code/AssetLib/Obj/ObjFileParser.cpp
+index fec1fe8..0e0a047 100644
+--- a/code/AssetLib/Obj/ObjFileParser.cpp
++++ b/code/AssetLib/Obj/ObjFileParser.cpp
+@@ -303,7 +303,7 @@ size_t ObjFileParser::getNumComponentsInDataDefinition() {
+         if (!SkipSpaces(&tmp, mEnd)) {
+             break;
+         }
+-        const bool isNum(IsNumeric(*tmp) || isNanOrInf(tmp));
++        const bool isNum(IsNumeric(*tmp) || isNanOrInf(tmp) || (*tmp == '.' && !IsLineEnd(*(tmp+1)) && IsNumeric(*(tmp+1))));
+         SkipToken(tmp, mEnd);
+         if (isNum) {
+             ++numComponents;
+diff --git a/code/PostProcessing/CalcTangentsProcess.cpp b/code/PostProcessing/CalcTangentsProcess.cpp
+index 8fd0632..7a19422 100644
+--- a/code/PostProcessing/CalcTangentsProcess.cpp
++++ b/code/PostProcessing/CalcTangentsProcess.cpp
+@@ -286,8 +286,8 @@ bool CalcTangentsProcess::ProcessMesh(aiMesh *pMesh, unsigned int meshIndex) {
+             smoothTangent += meshTang[closeVertices[b]];
+             smoothBitangent += meshBitang[closeVertices[b]];
+         }
+-        smoothTangent.Normalize();
+-        smoothBitangent.Normalize();
++        smoothTangent.NormalizeSafe();
++        smoothBitangent.NormalizeSafe();
+ 
+         // and write it back into all affected tangents
+         for (unsigned int b = 0; b < closeVertices.size(); ++b) {
+diff --git a/include/assimp/IOStreamBuffer.h b/include/assimp/IOStreamBuffer.h
+index 5a6924a..8da1930 100644
+--- a/include/assimp/IOStreamBuffer.h
++++ b/include/assimp/IOStreamBuffer.h
+@@ -234,47 +234,76 @@ AI_FORCE_INLINE size_t IOStreamBuffer<T>::getFilePos() const {
+ 
+ template <class T>
+ AI_FORCE_INLINE bool IOStreamBuffer<T>::getNextDataLine(std::vector<T> &buffer, T continuationToken) {
+-    buffer.resize(m_cacheSize);
+-    if (m_cachePos >= m_cacheSize || 0 == m_filePos) {
+-        if (!readNextBlock()) {
+-            return false;
+-        }
+-    }
++    buffer.clear();
++    bool inContinuationState = false;
++    while (true)
++    {
++        bool hasLineEndings = false;
++        while (m_cachePos >= m_cacheSize || 0 == m_filePos) {
++            if (!readNextBlock()) {
++                break;
++            }
+ 
+-    size_t i = 0;
+-    for (;;) {
+-        if (continuationToken == m_cache[m_cachePos] && IsLineEnd(m_cache[m_cachePos + 1])) {
+-            ++m_cachePos;
+-            while (m_cache[m_cachePos] != '\n') {
+-                ++m_cachePos;
++            // Skip empty lines
++            while (m_cachePos < m_cacheSize && IsLineEnd(m_cache[m_cachePos])) {
++                hasLineEndings = true;
++                m_cachePos++;
+             }
+             ++m_cachePos;
+-        } else if (IsLineEnd(m_cache[m_cachePos])) {
++        } 
++        if ( IsLineEnd ( m_cache[ m_cachePos ] ) ) {
+             break;
+         }
+ 
+-        buffer[i] = m_cache[m_cachePos];
+-        ++m_cachePos;
+-        ++i;
+-
+-        if(i == buffer.size()) {
+-            buffer.resize(buffer.size() * 2);
++        // If it's line end and not in continuation state, ending this line if it's not empty.
++        if (hasLineEndings && !inContinuationState && buffer.size() > 0) {
++            break;
+         }
+ 
+-        if (m_cachePos >= size()) {
++        if (m_cachePos >= m_cacheSize)
++        {
+             break;
+         }
+-        if (m_cachePos >= m_cacheSize) {
+-            if (!readNextBlock()) {
+-                return false;
++        else if (inContinuationState)
++        {
++            // If it's enter into continuation state, skip all line endings.
++            if (IsLineEnd(m_cache[m_cachePos]))
++            {
++                m_cachePos++;
++            }
++            else
++            {
++                inContinuationState = false;
++            }
++        }
++        else if (!IsLineEnd(m_cache[m_cachePos]))
++        {
++            buffer.push_back(m_cache[m_cachePos]);
++            m_cachePos++;
++        }
++        else // Line ending
++        {
++            m_cachePos++;
++            if (buffer.size() != 0)
++            {
++                // Line ending but the last character is continue token,
++                // continues to read next line
++                if (buffer.back() == continuationToken)
++                {
++                    inContinuationState = true;
++                    buffer.pop_back();
++                }
++                else // Finish line reading
++                {
++                    break;
++                }
+             }
+         }
+     }
++    buffer.push_back('\n');
+ 
+-    buffer[i] = '\n';
+-    ++m_cachePos;
++    return buffer.size() > 1;
+ 
+-    return true;
+ }
+ 
+ static AI_FORCE_INLINE bool isEndOfCache(size_t pos, size_t cacheSize) {

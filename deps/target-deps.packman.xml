@@ -1,0 +1,48 @@
+<project toolsVersion="5.0">
+
+    <!-- Imports the generated OpenUSD packman file -->
+    <!-- This allows repo_usd to generate the right packman -->
+    <!-- package file for the selected flavor and version of OpenUSD -->
+    <import path="usd-deps.packman.xml">
+        <filter include="usd-${config}" linkPath="../_build/target-deps/usd/${config}" />
+        <filter include="python" linkPath="../_build/target-deps/python" />
+    </import>
+
+    <!-- To build with a local FBX SDK, download the SDK from https://aps.autodesk.com/developer/overview/fbx-sdk -->
+    <!-- Then uncomment below and set the path to your FBX SDK installation -->
+    <!--
+    <dependency name="fbxsdk" linkPath="../_build/target-deps/fbxsdk">
+        <source path="C:/fbxsdk"/>
+    </dependency>
+    -->
+
+    <!--The unit tests currently only tests for FBX, OBJ, glTF, and glTF2 formats from the repos below. 
+    Refer to source/tests/python/test_public_samples.py for more details.-->
+
+    <!--assimp test models can be cloned from https://github.com/assimp/assimp/tree/master/test/models-->
+    <!-- Uncomment below and set the path to your assimp clone's test/models folder-->
+    <!--
+    <dependency name="assimp_sample_models" linkPath="../_build/target-deps/assimp_sample_models" tags="non-redist">
+        <source path="C:/assimp/test/models"/>
+    </dependency>
+    -->
+
+    <!--gltf test models can be cloned from https://github.com/KhronosGroup/glTF-Sample-Models-->
+    <!-- Uncomment below and set the path to your glTF-Sample_models clone folder-->
+    <!--
+    <dependency name="gltf_sample_models" linkPath="../_build/target-deps/gltf_sample_models" tags="non-redist">
+        <source path="C:/glTF-Sample-Models"/>
+    </dependency>
+    -->
+    
+    <!-- assimp, libxml2, draco, tinyxml2, doctest, and pybind11 are deployed from Conan Center. -->
+    <dependency name="omni_asset_validator" linkPath="../_build/target-deps/omni_asset_validator" tags="non-redist">
+        <package name="omni.asset_validator" version="1.15.1+v1-15-1.8753.60e8f059.gl.${platform_target_abi}"/>
+    </dependency>
+
+    <!-- omni_core_materials is required to avoid validation warnings for MDL Shaders -->
+    <dependency name="omni_core_materials" linkPath="../_build/target-deps/omni_core_materials" tags="non-redist">
+        <package name="omni_core_materials" version="1.3.2.1-b08f4d18" />
+    </dependency>
+
+</project>

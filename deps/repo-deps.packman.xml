@@ -1,0 +1,15 @@
+<project toolsVersion="5.0">
+  <!-- latest versions publicly available repo tools -->
+  <dependency name="repo_man" linkPath="../_repo/deps/repo_man">
+    <package name="repo_man" version="2.3.1"/>
+  </dependency>
+  <dependency name="repo_build" linkPath="../_repo/deps/repo_build">
+    <package name="repo_build" version="1.27.2"/>
+  </dependency>
+  <dependency name="repo_test" linkPath="../_repo/repo_test">
+    <package name="repo_test" version="2.46.1"/>
+  </dependency>
+  <dependency name="repo_usd" linkPath="../_repo/deps/repo_usd">
+    <package name="repo_usd" version="5.0.26" />
+  </dependency>
+</project>
