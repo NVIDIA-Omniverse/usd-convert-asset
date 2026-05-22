@@ -1,3 +1,6 @@
+# 9.0.10
+* Update agent skill metadata and structure for Skills as Docs compliance
+
 # 9.0.9
 * Update repository for OSRB compliance.
 
