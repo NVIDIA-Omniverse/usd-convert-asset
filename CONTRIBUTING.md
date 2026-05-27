@@ -56,9 +56,16 @@ Linux:
 ./repo.sh build --config release
 ```
 
-The repository can build against the default Packman FBX SDK dependency. To test
-against a local FBX SDK, edit `deps/target-deps.packman.xml` locally and point
-the `fbxsdk` dependency at your SDK installation. Do not commit local SDK paths.
+Developer source builds require Autodesk FBX SDK `2020.3.7` on Windows x86_64
+and Linux x86_64. Download it from
+`https://aps.autodesk.com/developer/overview/fbx-sdk`, review and accept
+Autodesk's license terms yourself, stage it into the layout expected by
+`premake5.lua` (`include` plus `lib/x64/release` on Windows or `lib/release` on
+Linux x86_64), then edit `deps/target-deps.packman.xml` locally and point the
+`fbxsdk` dependency at that staged folder. Do not commit local SDK paths.
+
+Linux aarch64 source builds do not use Autodesk FBX SDK because Autodesk does
+not support that target; FBX conversion uses Assimp instead.
 
 ## Building the Python Package
 

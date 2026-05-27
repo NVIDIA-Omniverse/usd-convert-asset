@@ -1,3 +1,6 @@
+# 9.0.11
+* Add `fbxsdk` repository dependency and document source installation steps for the agent skill
+
 # 9.0.10
 * Update agent skill metadata and structure for Skills as Docs compliance
 

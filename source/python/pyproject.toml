@@ -1,6 +1,6 @@
 [project]
 name = "usd-convert-asset"
-version = "9.0.10"
+version = "9.0.11"
 description = "usd-convert-asset"
 authors = [
     {name = "NVIDIA"},

@@ -63,7 +63,9 @@ More Python package details live in `source/python/README.md`.
 - Compiler: MSVC with Visual Studio 2019+ Build Tools on Windows.
 - Build tools: Premake, Windows SDK on Windows.
 - Runtime: Python 3.12 for Python package builds.
-- SDKs: FBX SDK (2020.3) installed locally. Tested with FBX SDK 2020.3.7
+- SDKs: FBX SDK (2020.3) for Windows x86_64 and Linux x86_64 source builds.
+  Developers must download it from Autodesk and stage it locally.
+  Tested with FBX SDK 2020.3.7.
 - GPU/Drivers: No GPU requirement for core conversion.
 
 On Windows, `repo.toml` must match the Visual Studio version installed on your
@@ -74,19 +76,28 @@ Studio 2022. You may also leave it empty to use the latest installed version.
 Windows has a 260-character path length limit. Enable long paths in Registry
 settings if needed.
 
-### Configure Local FBX SDK
+### Configure FBX SDK
 
-The default dependency manifest pulls FBX SDK `2020.3.7` through Packman. To test
-against a local FBX SDK, edit `deps/target-deps.packman.xml` and replace the
-`fbxsdk` package entries with a local source path. Use the folder that contains
-the `lib` and `include` folders.
+For Windows x86_64 and Linux x86_64 source builds, the repository can build
+against Autodesk FBX SDK `2020.3.7`. Developers must download FBX SDK
+from `https://aps.autodesk.com/developer/overview/fbx-sdk`, review and accept
+Autodesk's license terms themselves, stage the installed SDK into the layout
+that `premake5.lua` expects, then edit
+`deps/target-deps.packman.xml` locally and replace the `fbxsdk` package entries
+with a local source path to the staged folder:
+
+- Windows: `include` and `lib/x64/release`
+- Linux x86_64: `include` and `lib/release`
+
+For Linux aarch64, do not download or configure FBX SDK. Autodesk FBX SDK does
+not support this target, so FBX conversion uses Assimp instead.
 
 Treat this as a local-only dependency override. Do not commit machine-specific
 paths in `deps/target-deps.packman.xml`.
 
 ```xml
 <dependency name="fbxsdk" linkPath="../_build/target-deps/fbxsdk">
-    <source path="C:/path/to/your/fbxsdk"/>
+    <source path="C:/path/to/staged/fbxsdk-packman-layout"/>
 </dependency>
 ```
 
