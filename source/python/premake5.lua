@@ -14,6 +14,7 @@ project "usd_convert_asset[pip]"
         { "hatch_build.py", pip_package_dir.."/hatch_build.py" },
         { "pyproject.toml", pip_package_dir.."/pyproject.toml" },
         { repo_build.root.."/LICENSE", pip_package_dir.."/LICENSE" },
+        { repo_build.root.."/skills", pip_package_dir.."/skills" },
         { target_deps.."/usd/%{cfg.buildcfg}/bin/*${lib_ext}*", pip_package_dir.."/asset_converter_native_bindings/libs" },
         { target_deps.."/usd/%{cfg.buildcfg}/lib/*${lib_ext}*", pip_package_dir.."/asset_converter_native_bindings/libs" },
         { target_deps.."/usd/%{cfg.buildcfg}/lib/python", pip_package_dir.."/asset_converter_native_bindings/libs/lib/python" },

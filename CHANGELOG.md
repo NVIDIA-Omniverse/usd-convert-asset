@@ -1,3 +1,6 @@
+# 9.0.12
+* Update wheel publish script
+
 # 9.0.11
 * Add `fbxsdk` repository dependency and document source installation steps for the agent skill
 
