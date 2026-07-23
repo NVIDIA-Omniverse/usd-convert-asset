@@ -9,7 +9,7 @@ Use this reference only when the published `usd-convert-asset` package is unavai
 
 1. Inspect the local OS, architecture, and build configuration.
 2. If the target architecture is ARM64/aarch64, skip FBX SDK setup because Autodesk FBX SDK is not supported for that target; FBX conversion uses Assimp instead.
-3. For Windows x86_64 only, determine whether the machine uses Visual Studio 2019 or Visual Studio 2022, and check `repo.toml` for `repo_build.msbuild.vs_version`.
+3. For Windows x86_64, Visual Studio 2019 or 2022 must be installed. The build tools auto-detect the latest installed version among those supported releases only. Check or set `repo.toml`'s `repo_build.msbuild.vs_version` if you need to target a specific supported Visual Studio version.
 4. For Windows x86_64 and Linux x86_64 source builds, find the Autodesk FBX SDK download instructions from `https://aps.autodesk.com/developer/overview/fbx-sdk` and locate FBX SDK `2020.3.7`.
 5. Ask the user to download/run the Autodesk installer and review and accept Autodesk license terms themselves.
 6. Stage the installed SDK into the layout that `premake5.lua` expects:
@@ -52,12 +52,27 @@ Linux aarch64:
 
 Canonical platform build commands live in `README.md`, `source/python/README.md`, and `CONTRIBUTING.md`; keep copied commands in this reference consistent with those files.
 
+## Python Runtime Selection
+
+Use the Python runtime fetched by the repo build when installing or testing a
+built wheel. The wheel ABI follows `repo.toml`'s `python_ver`, not necessarily
+the bootstrap Python used by Packman or repo tooling.
+
+Do not create the test virtual environment with `tools/packman/python.bat` unless
+that interpreter version matches the wheel tag. For example, a wheel named
+`usd_convert_asset-...-cp312-cp312-win_amd64.whl` must be installed into a
+Python 3.12 environment.
+
+If pip reports that the wheel is "not a supported wheel on this platform", first
+verify that the virtual environment Python version matches the wheel tag.
+
 ## Install A Built Wheel
 
 Windows:
 
 ```powershell
-python -m venv .venv
+.\_build\target-deps\python\python.exe --version
+.\_build\target-deps\python\python.exe -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 Get-ChildItem dist\*.whl
@@ -69,7 +84,8 @@ python -c "import usd_convert_asset, asset_converter_native_bindings; print(usd_
 Linux:
 
 ```bash
-python3 -m venv .venv
+./_build/target-deps/python/bin/python3 --version
+./_build/target-deps/python/bin/python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
 ls dist/*.whl

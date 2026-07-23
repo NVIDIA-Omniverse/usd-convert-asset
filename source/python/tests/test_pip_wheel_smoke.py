@@ -84,6 +84,12 @@ class TestPipWheelSmoke(unittest.TestCase):
         self.assertIsInstance(native.OmniAssetConverter.major_version(), int)
         self.assertIsInstance(native.OmniAssetConverter.minor_version(), int)
 
+    def test_wheel_includes_agent_skill(self):
+        distribution = importlib.metadata.distribution(_DISTRIBUTION_NAME)
+        skill_path = Path(distribution.locate_file("usd_convert_asset/skills/omniverse-asset-to-usd/SKILL.md"))
+
+        self.assertTrue(skill_path.is_file(), msg=f"missing wheel skill artifact: {skill_path}")
+
     def test_cli_module_help(self):
         result = self._run_cli("--help")
 

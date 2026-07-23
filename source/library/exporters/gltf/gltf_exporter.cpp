@@ -6,7 +6,7 @@
 #include "../../common/common.h"
 #include "../../common/cubicSpline.h"
 #include "../../common/curveTessellation.h"
-#include "../../thirdparty/tiny_gltf.h"
+#include "../../common/tiny_gltf_include.h"
 #include "../../utils/utils.h"
 #include "usd_type_traits.h"
 

@@ -35,7 +35,10 @@
     </dependency>
     -->
     
-    <!-- assimp, libxml2, draco, tinyxml2, doctest, and pybind11 are deployed from Conan Center. -->
+    <!-- Conan-owned public dependencies are deployed by fetch.after_pull_commands in repo.toml. -->
+    <dependency name="sha1" linkPath="../_build/target-deps/sha1">
+        <package name="sha1" version="1431eaa" />
+    </dependency>
     <dependency name="omni_asset_validator" linkPath="../_build/target-deps/omni_asset_validator" tags="non-redist">
         <package name="omni.asset_validator" version="1.15.1+v1-15-1.8753.60e8f059.gl.${platform_target_abi}"/>
     </dependency>

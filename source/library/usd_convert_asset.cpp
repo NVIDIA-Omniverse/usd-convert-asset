@@ -114,12 +114,14 @@ static OmniConverterContext CreateConverterContext(
         }
 
         blob->size = asset->GetSize();
+        blob->buffer = nullptr;
         if (blob->size > 0)
         {
             blob->buffer = new uint8_t[asset->GetSize()];
             if (asset->Read(blob->buffer, asset->GetSize(), 0) == 0)
             {
                 delete[] (uint8_t*)blob->buffer;
+                blob->buffer = nullptr;
                 blob->size = 0;
                 return false;
             }

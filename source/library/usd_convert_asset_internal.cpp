@@ -5,10 +5,13 @@
 
 #include "utils/utils.h"
 
+#include <set>
+
 
 const static std::unordered_map<std::string, AssetType> gExtensionAssetMap = {
     { "fbx", AssetType::FBX },   { "obj", AssetType::OBJ },   { "gltf", AssetType::GLTF }, { "glb", AssetType::GLB }, { "usd", AssetType::USDC },
     { "usdc", AssetType::USDC }, { "usda", AssetType::USDA }, { "usdz", AssetType::USDZ }, { "bvh", AssetType::BVH }, { "stl", AssetType::STL },
+    { "ply", AssetType::PLY },   { "lxo", AssetType::LXO },   { "md5", AssetType::MD5 },
 };
 
 static AssetType FileFormatToAssetType(const PXR_NS::SdfFileFormatConstPtr& fileFormat)
@@ -261,7 +264,7 @@ OmniConverterBlobPtr OmniConverterContext::ReadFile(const std::string& path) con
         return nullptr;
     }
 
-    OmniConverterBlob blob;
+    OmniConverterBlob blob{};
     bool success = mCallbacks.readCallback(path.c_str(), &blob);
     if (!success)
     {
@@ -345,6 +348,40 @@ bool OmniConverterContext::IsImportAssetGltfOrGlb() const
 bool OmniConverterContext::IsImportAssetUsdcOrUsdaOrUsdz() const
 {
     return mImportAssetType == AssetType::USDC || mImportAssetType == AssetType::USDA || mImportAssetType == AssetType::USDZ;
+}
+
+bool OmniConverterContext::IsSupportedImportAsset() const
+{
+    if (IsInMemoryImport() || mCachedStage)
+    {
+        return true;
+    }
+
+    const std::string extension = StringUtils::ToLower(PathUtils::GetExtension(mImportAssetPath));
+    return gExtensionAssetMap.find(extension) != gExtensionAssetMap.end();
+}
+
+std::string OmniConverterContext::GetSupportedImportFormatsForError()
+{
+    std::set<std::string> extensions;
+    for (const auto& entry : gExtensionAssetMap)
+    {
+        extensions.insert(entry.first);
+    }
+
+    std::string formatted;
+    for (const auto& extension : extensions)
+    {
+        if (!formatted.empty())
+        {
+            formatted += ", ";
+        }
+
+        formatted += ".";
+        formatted += extension;
+    }
+
+    return formatted;
 }
 
 bool OmniConverterContext::IsOutputAssetGltfOrGlb() const

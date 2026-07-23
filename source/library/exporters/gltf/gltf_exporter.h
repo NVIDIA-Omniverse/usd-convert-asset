@@ -3,9 +3,9 @@
 //
 #pragma once
 
+#include "../../common/tiny_gltf_include.h"
 #include "../../converter_future.h"
 #include "../../stage.h"
-#include "../../thirdparty/tiny_gltf.h"
 #include "../../usd_convert_asset_internal.h"
 #include "../exporter.h"
 

@@ -10,19 +10,14 @@
 #endif
 
 #include <cstdlib> // for free()
-
-// STB_IMAGE_IMPLEMENTATION and STB_IMAGE_WRITE_IMPLEMENTATION are already
-// defined in tiny_gltf.cpp to avoid duplicate symbol linker errors
-#define STBI_FREE(p) free(p)
-#include "../thirdparty/stb_image.h"
+#include <stb_image.h>
 
 #if defined(_WIN32)
 #    define STBI_MSC_SECURE_CRT
 #endif
 
 #undef snprintf
-#define STBIW_FREE(p) free(p)
-#include "../thirdparty/stb_image_write.h"
+#include <stb_image_write.h>
 
 // Forward declare stbi_write_png_to_mem which is defined in tiny_gltf.cpp
 // but not part of the public API in stb_image_write.h

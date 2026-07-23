@@ -6,7 +6,7 @@ __all__ = [
     "get_version",
 ]
 
-__version__ = "${version}"
+__version__ = "${version}${pip_package_version_suffix}"
 
 
 def get_version():

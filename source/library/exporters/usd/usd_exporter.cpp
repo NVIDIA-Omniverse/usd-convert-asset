@@ -80,49 +80,9 @@ const static std::string USD_FILE_EXT = ".usda";
 const static std::string USD_FILE_EXT = ".usd";
 #endif
 
-static std::string MakeValidIdentifier(const std::string& in)
-{
-// see https://openusd.org/dev/api/_usd__page__u_t_f_8.html
-#if PXR_MINOR_VERSION >= 24
-    if (in.empty())
-    {
-        return "_";
-    }
-
-    constexpr PXR_NS::TfUtf8CodePoint cp_underscore = PXR_NS::TfUtf8CodePointFromAscii('_');
-
-    bool first_cp = true;
-    std::stringstream stream;
-    for (auto cp : PXR_NS::TfUtf8CodePointView{ in })
-    {
-        const bool cp_allowed = first_cp ? (cp == cp_underscore || PXR_NS::TfIsUtf8CodePointXidStart(cp)) : PXR_NS::TfIsUtf8CodePointXidContinue(cp);
-        if (!cp_allowed)
-        {
-            stream << '_';
-        }
-        else
-        {
-            stream << cp;
-        }
-
-        first_cp = false;
-    }
-    return stream.str();
-#else
-    return PXR_NS::TfMakeValidIdentifier(in);
-#endif
-}
-
-
 static std::string MakeValidUSDIdentifier(const std::string& name, const std::string& prefix)
 {
-    auto validName = MakeValidIdentifier(name);
-    if (validName.empty() || validName[0] == '_')
-    {
-        validName = prefix + validName;
-    }
-
-    return validName;
+    return NameUtils::MakeValidUSDIdentifier(name, prefix);
 }
 
 static PXR_NS::TfToken ProjectionToToken(PXR_NS::GfCamera::Projection projection)
@@ -807,7 +767,7 @@ OmniConverterStatus UsdExporter::Export(const StagePtr& stage, std::string& deta
             status = ExportStageTree(stage, detailedError);
             if (status == OmniConverterStatus::OK)
             {
-                ExportAnimations(stage, detailedError);
+                status = ExportAnimations(stage, detailedError);
             }
         }
     }
@@ -859,6 +819,11 @@ OmniConverterStatus UsdExporter::Export(const StagePtr& stage, std::string& deta
 
 OmniConverterStatus UsdExporter::WriteLayerTo(PXR_NS::SdfLayerRefPtr layer, const std::string& path, std::string& detailedError)
 {
+    if (mExportContext->IsExited())
+    {
+        return OmniConverterStatus::CANCELLED;
+    }
+
     if (!PXR_NS::SdfLayer::IsAnonymousLayerIdentifier(path))
     {
         auto basePath = PathUtils::GetDirName(path);
@@ -870,9 +835,11 @@ OmniConverterStatus UsdExporter::WriteLayerTo(PXR_NS::SdfLayerRefPtr layer, cons
         }
     }
 
+    Log("Writing USD layer: " + path);
     bool success = mExportContext->converterContext.WriteUsdLayer(path, layer->GetIdentifier());
     if (success)
     {
+        Log("Finished writing USD layer: " + path);
         return OmniConverterStatus::OK;
     }
     else
@@ -1240,7 +1207,7 @@ OmniConverterStatus UsdExporter::ExportTextures(const StagePtr& stage, std::stri
 OmniConverterStatus UsdExporter::ExportInstancedMeshes(const StagePtr& stage, std::string& detailedError)
 {
     Log("Starting to export meshes...");
-    std::unordered_map<std::string, size_t> uniqueMeshFileNames;
+    NameUtils::NameCache uniqueMeshFileNames;
     for (size_t i = 0; i < stage->meshes.size(); i++)
     {
         mExportContext->IncrementProgress();
@@ -1295,10 +1262,15 @@ OmniConverterStatus UsdExporter::ExportStageTree(const StagePtr& stage, std::str
         ENSURE_STATUS_OK(ExportInstancedMeshes(stage, detailedError));
     }
 
-    std::unordered_map<std::string, size_t> nodeInstanceNameCount;
+    NameUtils::NameCache nodeInstanceNameCount;
+    Log("Starting to author USD stage tree.");
     ENSURE_STATUS_OK(TraverseAndExport(stage, stage->rootNode, usdLayer, PXR_NS::SdfPath::AbsoluteRootPath(), nodeInstanceNameCount));
+    Log("Finished authoring USD stage tree.");
 
-    return WriteLayerTo(usdLayer, mPropsFilePath, detailedError);
+    ENSURE_STATUS_OK(WriteLayerTo(usdLayer, mPropsFilePath, detailedError));
+    mExportContext->IncrementProgress();
+
+    return OmniConverterStatus::OK;
 }
 
 OmniConverterStatus UsdExporter::ExportAnimationClip(const StagePtr& stage, std::string& detailedError)
@@ -1522,7 +1494,7 @@ OmniConverterStatus UsdExporter::TraverseAndExport(
     const StageNodePtr& stageNode,
     PXR_NS::SdfLayerRefPtr usdLayer,
     const PXR_NS::SdfPath& parentPrimPath,
-    std::unordered_map<std::string, size_t>& uniqueNameCount
+    NameUtils::NameCache& uniqueNameCount
 )
 {
     // Skip empty node
@@ -1557,7 +1529,7 @@ OmniConverterStatus UsdExporter::TraverseAndExport(
         SetDefaultTransform(xformPrimSpec, stageNode->localTransform, useDoublePrecisionOps, useTESOps);
     }
 
-    std::unordered_map<std::string, size_t> uniqueInstanceNameCount;
+    NameUtils::NameCache uniqueInstanceNameCount;
 
     // Export mesh instances
     stageNodeInfo.meshInstancePaths.resize(stageNode->staticMeshInstances.size());
@@ -1786,7 +1758,7 @@ PXR_NS::SdfPrimSpecHandle UsdExporter::ExportSkeletonAndSkinning(
     );
 
     std::unordered_set<MeshPtr> meshes;
-    std::unordered_map<std::string, size_t> uniqueSkinMeshNameCount;
+    NameUtils::NameCache uniqueSkinMeshNameCount;
 
     for (const auto& skinMesh : stage->skinMeshes)
     {
@@ -2069,7 +2041,7 @@ PXR_NS::SdfPrimSpecHandle UsdExporter::ExportMeshInternal(
 
     if (mesh->meshSubsets.size() > 1)
     {
-        std::unordered_map<std::string, size_t> uniqueSubsetNames;
+        NameUtils::NameCache uniqueSubsetNames;
 
         for (size_t i = 0; i < mesh->meshSubsets.size(); i++)
         {
@@ -2162,7 +2134,7 @@ OmniConverterStatus UsdExporter::ExportAnimations(const StagePtr& stage, std::st
 
     std::vector<std::string> allAnimationTracks;
     std::vector<std::string> allSkeletalAnimationLayers;
-    std::unordered_map<std::string, size_t> uniqueAnimationNames;
+    NameUtils::NameCache uniqueAnimationNames;
     for (size_t trackIndex = 0; trackIndex < stage->animationTracks.size(); trackIndex++)
     {
         mExportContext->IncrementProgress();
@@ -3032,53 +3004,9 @@ void UsdExporter::PreprocessAllNodes(const StagePtr& stage)
     );
 }
 
-UsdExporter::NameInfo UsdExporter::GetNameInfo(
-    const std::string& baseName,
-    const std::string& prefix,
-    std::unordered_map<std::string, size_t>& nameMap
-)
+UsdExporter::NameInfo UsdExporter::GetNameInfo(const std::string& baseName, const std::string& prefix, NameUtils::NameCache& nameMap)
 {
-    auto validName = MakeValidIdentifier(baseName);
-    NameInfo info;
-    if (validName.empty() || validName[0] == '_')
-    {
-        validName = prefix + validName;
-        info.displayName = baseName;
-    }
-
-    // Convert to lowercase for case-insensitive comparison
-    std::string lowerValidName = PXR_NS::TfStringToLower(validName);
-    std::string uniqueName = validName;
-
-    // Find any existing name that matches case-insensitively
-    auto iter = std::find_if(
-        nameMap.begin(),
-        nameMap.end(),
-        [&lowerValidName](const auto& pair)
-        {
-            return PXR_NS::TfStringToLower(pair.first) == lowerValidName;
-        }
-    );
-
-    // If a name collision is found, append a number to the name and recheck
-    while (iter != nameMap.end())
-    {
-        uniqueName = validName + std::to_string(iter->second);
-        iter->second += 1;
-        // Check for case-insensitive match with the new name
-        iter = std::find_if(
-            nameMap.begin(),
-            nameMap.end(),
-            [&uniqueName](const auto& pair)
-            {
-                return PXR_NS::TfStringToLower(pair.first) == PXR_NS::TfStringToLower(uniqueName);
-            }
-        );
-    }
-    nameMap.insert({ uniqueName, 0 });
-    info.name = uniqueName;
-
-    return info;
+    return NameUtils::GetValidName(baseName, prefix, nameMap);
 }
 
 void UsdExporter::SetXformTransformSamples(

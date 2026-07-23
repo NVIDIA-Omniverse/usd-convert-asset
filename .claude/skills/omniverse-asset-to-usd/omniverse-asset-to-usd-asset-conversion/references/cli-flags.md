@@ -20,7 +20,7 @@ usd-convert-asset -i scene.fbx -o scene.usda --ignore-materials --ignore-animati
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-i` / `--input` | required | Input asset file path. |
-| `-o` / `--output` | required | Output USD file path: `.usd`, `.usda`, `.usdc`, or `.usdz`. |
+| `-o` / `--output` | required | Output USD file path: `.usd`, `.usda`, or `.usdc`. |
 | `--ignore-materials` | false | Do not export materials. |
 | `--ignore-animation` | false | Do not export animation. |
 | `--single-mesh` | false | Export a single mesh USD file. |
@@ -28,7 +28,6 @@ usd-convert-asset -i scene.fbx -o scene.usda --ignore-materials --ignore-animati
 | `--ignore-cameras` | false | Do not export cameras. |
 | `--ignore-lights` | false | Do not export lights. |
 | `--preview-surface` | false | Export USD Preview Surface materials. Flavor-sensitive `AUTOREMOVE` option. |
-| `--embed-textures` | false | Embed textures in exported assets. |
 | `--fbx-y-up` | false | Convert imported FBX stage to Y-up. |
 | `--fbx-z-up` | false | Convert imported FBX stage to Z-up. |
 | `--keep-all-materials` | false | Keep materials not referenced by meshes. |

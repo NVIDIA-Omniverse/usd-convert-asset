@@ -1,18 +1,17 @@
 [project]
 name = "usd-convert-asset"
-version = "9.0.12"
-description = "usd-convert-asset"
+version = "1.0.0"
+description = "Asset Converter that converts common asset file formats to OpenUSD"
 authors = [
     {name = "NVIDIA"},
 ]
 license = {text = "Apache-2.0 AND CC-BY-4.0"}
 readme = "README.md"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.12,<3.13"
 dependencies = []
 
 [project.urls]
-Homepage = "https://developer.nvidia.com/omniverse"
-Documentation = "https://docs.omniverse.nvidia.com"
+Repository = "https://github.com/NVIDIA-Omniverse/usd-convert-asset"
 
 [project.scripts]
 usd-convert-asset = "usd_convert_asset.cli:main"
@@ -26,35 +25,34 @@ include = [
     "/usd_convert_asset/**",
     "/asset_converter_native_bindings/**",
     "/PACKAGE-LICENSES/**",
-    "/skills/**",
 ]
 
 [tool.hatch.build.targets.sdist.force-include]
 "asset_converter_native_bindings" = "asset_converter_native_bindings"
 "PACKAGE-LICENSES" = "PACKAGE-LICENSES"
 "LICENSE" = "LICENSE"
-"skills" = "skills"
 
 [tool.hatch.build.targets.sdist.hooks.custom]
 path = "hatch_build.py"
+manylinux-platform = "2.35"
 
 [tool.hatch.build.targets.wheel]
 packages = ["usd_convert_asset"]
 artifacts = [
     "usd_convert_asset/_version.py",
+    "usd_convert_asset/skills/**",
     "asset_converter_native_bindings/**",
     "PACKAGE-LICENSES/**",
-    "skills/**",
 ]
 
 [tool.hatch.build.targets.wheel.force-include]
 "asset_converter_native_bindings" = "asset_converter_native_bindings"
 "PACKAGE-LICENSES" = "PACKAGE-LICENSES"
 "LICENSE" = "LICENSE"
-"skills" = "skills"
 
 [tool.hatch.build.targets.wheel.hooks.custom]
 path = "hatch_build.py"
+manylinux-platform = "2.35"
 
 [build-system]
 requires = ["hatchling"]

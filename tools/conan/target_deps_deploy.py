@@ -9,12 +9,26 @@ CONFIGURED_DEPENDENCIES = {
     "doctest": "doctest",
     "draco": os.path.join("draco", "{config}"),
     "libxml2": os.path.join("libxml2", "{config}"),
+    "nlohmann_json": "nlohmann_json",
     "pybind11": "pybind11",
+    "stb": "stb",
+    "tinygltf": "tinygltf",
+    "tinyobjloader": os.path.join("tinyobjloader", "{config}"),
     "tinyxml2": "tinyxml2",
 }
 
 
+def _deploy_filter() -> set[str] | None:
+    value = os.environ.get("CONAN_DEPLOY_DEPENDENCIES")
+    if not value:
+        return None
+    return {dependency.strip() for dependency in value.split(",") if dependency.strip()}
+
+
 def _remove_tree(path: str):
+    if os.path.islink(path) or (hasattr(os.path, "isjunction") and os.path.isjunction(path)):
+        os.unlink(path)
+        return
     if os.path.isdir(path):
         shutil.rmtree(path)
 
@@ -83,6 +97,9 @@ def deploy(graph, output_folder: str, **kwargs):
     metadata_prefix = _metadata_prefix(conanfile)
 
     _remove_tree(runtime_root)
+    deploy_filter = _deploy_filter()
     for _, dep in conanfile.dependencies.host.items():
+        if deploy_filter is not None and dep.ref.name not in deploy_filter:
+            continue
         _copy_dependency(dep, output_folder, config, metadata_prefix)
         _copy_runtime_libs(dep, runtime_root)

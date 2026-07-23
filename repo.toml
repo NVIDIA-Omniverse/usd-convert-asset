@@ -7,6 +7,7 @@ version = "${file:${root}/VERSION.md}"
 usd_flavor = "usd"
 usd_ver = "25.11"
 python_ver = "3.12"
+pip_package_version_suffix = ""
 abi = "2.35"
 
 # Windows doesn't need abi configured. This is required to build with repo_man 2.3.1
@@ -38,6 +39,7 @@ fetch.pip.licensing_enabled = false
 fetch.before_pull_commands = [
     [
         "$root/repo${shell_ext}",
+        "--set-token", "pip_package_version_suffix:${pip_package_version_suffix}",
         "subst",
     ],
     [
@@ -49,7 +51,6 @@ fetch.before_pull_commands = [
         "--python-ver", "${python_ver}",
     ],
 ]
-
 
 fetch.after_pull_commands = [
     [
@@ -135,7 +136,6 @@ executables = [
 [repo_build.docker]
 enabled = false
 
-
 [[repo_build.argument]]
 name = "--usd-flavor"
 help = "Flavor of OpenUSD to use"
@@ -150,14 +150,14 @@ kwargs.dest = "usd_flavor"
 name = "--usd-ver"
 help = "Version of the OpenUSD flavor to use in the format x.y"
 kwargs.nargs = 1
-kwargs.default = "24.05"
+kwargs.default = "25.11"
 kwargs.dest = "usd_ver"
 
 [[repo_build.argument]]
 name = "--python-ver"
 help = "Version of Python compatible with selected OpenUSD flavor and version"
 kwargs.nargs = 1
-kwargs.default = "3.11"
+kwargs.default = "3.12"
 kwargs.dest = "python_ver"
 
 

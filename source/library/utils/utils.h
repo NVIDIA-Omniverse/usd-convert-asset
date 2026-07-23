@@ -5,6 +5,7 @@
 
 #include "image_utils.h"
 #include "math_utils.h"
+#include "name_utils.h"
 #include "path_utils.h"
 #include "stage_utils.h"
 #include "string_utils.h"

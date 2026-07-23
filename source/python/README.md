@@ -6,6 +6,17 @@ This package is staged from the existing repo build output. The native bindings,
 runtime libraries, USD plugin resources, optional staged data, and generated
 third-party license bundle are copied into a wheel source tree under `_build`.
 
+## OpenUSD Runtime Compatibility
+
+`usd-convert-asset` ships with and uses its own bundled OpenUSD runtime. Do not
+mix it with another OpenUSD or `usd-core` installation in the same Python
+process; competing `pxr` modules and native libraries can conflict.
+
+If a workflow also uses other USD Python code, install the converter in a
+dedicated virtual environment and run conversion in a separate process. Invoke
+`usd-convert-asset` as a subprocess or use its CLI without importing both
+runtimes into one process.
+
 ## Building From Source
 
 Run the normal repo build first. This compiles `asset_converter_native_bindings`,
@@ -58,7 +69,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install dist\usd_convert_asset-<version>-<python>-<abi>-<platform>.whl
 usd-convert-asset -i path\to\input.fbx -o path\to\output.usda
-.\.venv\Scripts\python.exe -m usd_convert_asset -i path\to\input.obj -o path\to\output.usdz
+.\.venv\Scripts\python.exe -m usd_convert_asset -i path\to\input.obj -o path\to\output.usdc
 ```
 
 Linux:
@@ -69,7 +80,7 @@ source .venv/bin/activate
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install dist/usd_convert_asset-<version>-<python>-<abi>-<platform>.whl
 usd-convert-asset -i path/to/input.fbx -o path/to/output.usda
-.venv/bin/python -m usd_convert_asset -i path/to/input.obj -o path/to/output.usdz
+.venv/bin/python -m usd_convert_asset -i path/to/input.obj -o path/to/output.usdc
 ```
 
 To test the staged tree before building a wheel, replace the wheel install with

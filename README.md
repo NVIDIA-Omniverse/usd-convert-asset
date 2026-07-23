@@ -6,7 +6,7 @@ bindings, and USD plugin resources for converting source assets to USD.
 ## Overview
 
 usd-convert-asset provides native and Python entry points for converting
-3D asset files into USD, USDA, USDC, or USDZ outputs. It is intended for tools
+3D asset files into USD, USDA, or USDC outputs. It is intended for tools
 and pipelines that need scriptable asset ingestion into OpenUSD-based workflows.
 
 Key repository areas:
@@ -57,10 +57,21 @@ Replace `<platform>` with the build platform:
 
 More Python package details live in `source/python/README.md`.
 
+### OpenUSD Runtime Compatibility
+
+`usd-convert-asset` ships with and uses its own bundled OpenUSD runtime. Do not
+mix it with another OpenUSD or `usd-core` installation in the same Python
+process; competing `pxr` modules and native libraries can conflict.
+
+For workflows that also run other USD Python code, isolate conversion in a
+separate process and environment. Use a dedicated virtual environment and
+invoke `usd-convert-asset` as a subprocess or through its CLI instead of
+importing both runtimes into one process.
+
 ## Requirements
 
 - OS/Arch: Windows 10 or Ubuntu 22.04.
-- Compiler: MSVC with Visual Studio 2019+ Build Tools on Windows.
+- Compiler: MSVC with Visual Studio 2019 or 2022 Build Tools on Windows.
 - Build tools: Premake, Windows SDK on Windows.
 - Runtime: Python 3.12 for Python package builds.
 - SDKs: FBX SDK (2020.3) for Windows x86_64 and Linux x86_64 source builds.
@@ -112,21 +123,18 @@ usd-convert-asset -i path/to/input.fbx -o path/to/output.usda --progress
 ```
 
 ```bash
-python -m usd_convert_asset -i path/to/input.obj -o path/to/output.usdz
+python -m usd_convert_asset -i path/to/input.obj -o path/to/output.usdc
 ```
 
 Common conversion options include `--single-mesh`, `--ignore-materials`,
-`--ignore-animation`, `--preview-surface`, `--embed-textures`, `--fbx-y-up`,
-`--fbx-z-up`, `--stage-up-y`, and `--stage-up-z`.
+`--ignore-animation`, `--preview-surface`, `--fbx-y-up`, `--fbx-z-up`,
+`--stage-up-y`, and `--stage-up-z`.
 
 Common examples:
 
 ```bash
-# Choose output format by extension: .usd, .usda, .usdc, or .usdz.
+# Choose output format by extension: .usd, .usda, or .usdc.
 usd-convert-asset -i path/to/input.fbx -o path/to/output.usdc
-
-# Embed textures for portable USDZ output.
-usd-convert-asset -i path/to/input.fbx -o path/to/output.usdz --embed-textures
 
 # Convert FBX up-axis and force the output stage to Y-up.
 usd-convert-asset -i path/to/input.fbx -o path/to/output.usda --fbx-y-up --stage-up-y
@@ -152,6 +160,8 @@ done
 Use GitHub pull requests for code changes and include build or test coverage
 appropriate for the change.
 
+Start with `CONTRIBUTING.md` for contribution requirements.
+
 Before opening a pull request, run a release build and the relevant tests.
 
 Windows:
@@ -172,19 +182,19 @@ The default test suite covers Python unit tests and the C++ Catch2 test binary.
 For Python package changes, also build and install the wheel from `dist/` and run
 a CLI smoke conversion with a small asset.
 
-### Governance & Maintainers
+## Governance & Maintainers
 
 This project is maintained by NVIDIA. Project governance, maintainers, and
 triage policy are managed by the repository owners.
 
-### Security
+## Security
 
 - Vulnerability disclosure: `SECURITY.md`
 - Do not file public issues for security reports.
 
-### Support
+## Support
 
-- Level: Community support through repository issues.
+- Level: Maintained, with community support through repository issues.
 - How to get help: Open a GitHub issue with environment details, input asset
   type, conversion command, and error output.
 - Include: OS/architecture, converter version or commit SHA, FBX SDK version,

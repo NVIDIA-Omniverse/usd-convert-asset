@@ -29,6 +29,9 @@ enum class AssetType
     USDZ,
     BVH,
     STL,
+    PLY,
+    LXO,
+    MD5,
     OTHER
 };
 
@@ -296,6 +299,8 @@ public:
 
     bool IsImportAssetGltfOrGlb() const;
     bool IsImportAssetUsdcOrUsdaOrUsdz() const;
+    bool IsSupportedImportAsset() const;
+    static std::string GetSupportedImportFormatsForError();
 
     bool IsOutputAssetGltfOrGlb() const;
     bool IsOutputAssetUsdcOrUsdaOrUsdz() const;

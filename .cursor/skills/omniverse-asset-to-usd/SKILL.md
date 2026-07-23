@@ -27,8 +27,8 @@ Load the narrowest module that matches the user's task:
 ## Use This Skill For
 
 - Install, verify, build, or troubleshoot the `usd-convert-asset` package.
-- Convert `.fbx`, `.obj`, `.gltf`, `.glb`, `.stl`, or `.ply` assets to `.usd`, `.usda`, `.usdc`, or `.usdz`.
-- Choose CLI flags for materials, animation, mesh handling, FBX up-axis conversion, stage up-axis, texture embedding, progress, or debug logging.
+- Convert `.fbx`, `.obj`, `.gltf`, `.glb`, `.stl`, or `.ply` assets to `.usd`, `.usda`, or `.usdc`.
+- Choose CLI flags for materials, animation, mesh handling, FBX up-axis conversion, stage up-axis, progress, or debug logging.
 - Update code, docs, tests, packaging, or release behavior for asset-to-USD conversion workflows.
 
 Do not use this skill for Gaussian Splat, URDF, CAD-native, or unrelated USD workflows unless `usd-convert-asset` is the relevant converter.
@@ -39,3 +39,4 @@ Do not use this skill for Gaussian Splat, URDF, CAD-native, or unrelated USD wor
 2. Build from source only when the published package is unavailable for the target environment, or when the user is changing this repository.
 3. Validate source and destination formats before invoking the converter.
 4. Keep CLI examples, README snippets, and smoke tests aligned when flags, entry points, install flow, or package metadata change.
+5. Treat the package's bundled OpenUSD runtime as process-local. If a workflow uses another OpenUSD or `usd-core` installation, run `usd-convert-asset` in a separate process from a dedicated virtual environment, or invoke only its CLI, to avoid `pxr` and native-library conflicts.

@@ -31,6 +31,7 @@ For actual conversions, CLI flag selection, format validation, or conversion tro
 3. For source builds on Windows x86_64 or Linux x86_64, developers must download Autodesk FBX SDK `2020.3.7`, stage it locally into the layout expected by `premake5.lua`, and point `deps/target-deps.packman.xml` at that staged folder.
 4. Do not accept Autodesk FBX SDK license terms, run a silent Autodesk installer, or commit a user-specific FBX SDK path on the user's behalf.
 5. When installing a locally built wheel, type the exact wheel filename from `dist`; do not rely on shell wildcards.
+6. `usd-convert-asset` ships with and uses a bundled OpenUSD runtime. Do not load it in the same Python process as another OpenUSD or `usd-core` installation. For mixed USD workflows, install it in a dedicated virtual environment and invoke the converter through a subprocess or its CLI to avoid `pxr` and native-library conflicts.
 
 ## Prerequisites
 

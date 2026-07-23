@@ -3,8 +3,9 @@
 //
 #pragma once
 
-#include "../../thirdparty/tiny_obj_loader.h"
 #include "../importer.h"
+
+#include <tiny_obj_loader.h>
 
 
 class ObjImporter : public Importer

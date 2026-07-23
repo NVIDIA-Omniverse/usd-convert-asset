@@ -3,7 +3,7 @@
 //
 #pragma once
 
-#include "../../thirdparty/tiny_gltf.h"
+#include "../../common/tiny_gltf_include.h"
 #include "../importer.h"
 
 class GltfImporter : public Importer
@@ -70,6 +70,7 @@ private:
     tinygltf::Model mGltfModel;
     bool mModelLoaded = false;
     bool mModelLoadedSuccessfully = false;
+    OmniConverterStatus mModelLoadStatus = OmniConverterStatus::FILE_READ_ERROR;
     std::string mModelLoadError;
     std::set<int> mVisitedNodes;
 };

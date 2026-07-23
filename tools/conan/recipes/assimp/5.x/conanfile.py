@@ -159,6 +159,10 @@ class AssimpConan(ConanFile):
     def _depends_on_openddlparser(self):
         return self.options.with_opengex
 
+    @property
+    def _depends_on_earcut(self):
+        return Version(self.version) >= "6.0.0"
+
     def requirements(self):
         self.requires("minizip/1.2.13")
         self.requires("pugixml/1.14")
@@ -178,6 +182,8 @@ class AssimpConan(ConanFile):
             self.requires("stb/cci.20230920")
         if self._depends_on_openddlparser:
             self.requires("openddl-parser/0.5.1")
+        if self._depends_on_earcut:
+            self.requires("earcut/2.2.4")
 
     def validate(self):
         if self.settings.compiler.cppstd:
@@ -199,14 +205,16 @@ class AssimpConan(ConanFile):
     def source(self):
         get(
             self,
-            url="https://github.com/assimp/assimp/archive/refs/tags/v5.4.3.tar.gz",
-            sha256="66dfbaee288f2bc43172440a55d0235dfc7bf885dda6435c038e8000e79582cb",
+            url="https://github.com/assimp/assimp/archive/refs/tags/v6.0.2.tar.gz",
+            sha256="d1822d9a19c9205d6e8bc533bf897174ddb360ce504680f294170cc1d6319751",
             strip_root=True,
         )
         copy(self, "conan_deps.cmake", self.export_sources_folder, self.source_folder)
 
     def generate(self):
         tc = CMakeToolchain(self)
+        if self.settings.os == "Linux":
+            tc.extra_cxxflags.append("-fstack-protector-all")
         tc.variables["ASSIMP_ANDROID_JNIIOSYSTEM"] = False
         tc.variables["ASSIMP_BUILD_ALL_IMPORTERS_BY_DEFAULT"] = False
         tc.variables["ASSIMP_BUILD_ALL_EXPORTERS_BY_DEFAULT"] = False
@@ -240,6 +248,7 @@ class AssimpConan(ConanFile):
         tc.cache_variables["CMAKE_PROJECT_Assimp_INCLUDE"] = "conan_deps.cmake"
         tc.cache_variables["WITH_CLIPPER"] = self._depends_on_clipper
         tc.cache_variables["WITH_DRACO"] = self._depends_on_draco
+        tc.cache_variables["WITH_EARCUT"] = self._depends_on_earcut
         tc.cache_variables["WITH_KUBAZIP"] = self._depends_on_kuba_zip
         tc.cache_variables["WITH_OPENDDL"] = self._depends_on_openddlparser
         tc.cache_variables["WITH_POLY2TRI"] = self._depends_on_poly2tri
@@ -255,7 +264,7 @@ class AssimpConan(ConanFile):
         VirtualBuildEnv(self).generate()
 
     def _patch_sources(self):
-        patch(self, patch_file=Path(self.export_sources_folder) / "patches" / "0001-nv-patches.patch")
+        patch(self, patch_file=Path(self.export_sources_folder) / "patches" / "6.0.2-0001-apply-internal-fixes.patch")
         source_root = Path(self.source_folder)
 
         for pattern in [
@@ -291,6 +300,7 @@ class AssimpConan(ConanFile):
 
         for contrib_header, include in [
             (Path("clipper") / "clipper.hpp", "polyclipping/clipper.hpp"),
+            (Path("earcut-hpp") / "earcut.hpp", "mapbox/earcut.hpp"),
             (Path("poly2tri") / "poly2tri" / "poly2tri.h", "poly2tri/poly2tri.h"),
             (Path("stb") / "stb_image.h", "stb_image.h"),
             (Path("utf8cpp") / "source" / "utf8.h", "utf8.h"),

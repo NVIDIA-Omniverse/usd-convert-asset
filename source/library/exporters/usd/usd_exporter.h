@@ -6,6 +6,7 @@
 #include "../../converter_future.h"
 #include "../../stage.h"
 #include "../../usd_convert_asset_internal.h"
+#include "../../utils/name_utils.h"
 #include "../exporter.h"
 
 class UsdExporter : public Exporter
@@ -45,7 +46,7 @@ private:
         const StageNodePtr& stageNode,
         PXR_NS::SdfLayerRefPtr usdLayer,
         const PXR_NS::SdfPath& parentPrimPath,
-        std::unordered_map<std::string, size_t>& uniqueNameCount
+        NameUtils::NameCache& uniqueNameCount
     );
     PXR_NS::SdfPrimSpecHandle ExportSkeletonAndSkinning(
         const StagePtr& stage,
@@ -100,12 +101,8 @@ private:
     );
     void PreprocessAllNodes(const StagePtr& stage);
 
-    struct NameInfo
-    {
-        std::string name; // An unique name compatible with USD identifier.
-        std::string displayName; // Optional display name.
-    };
-    NameInfo GetNameInfo(const std::string& baseName, const std::string& prefix, std::unordered_map<std::string, size_t>& nameMap);
+    using NameInfo = NameUtils::NameInfo;
+    NameInfo GetNameInfo(const std::string& baseName, const std::string& prefix, NameUtils::NameCache& nameMap);
 
     void SetXformTransformSamples(
         PXR_NS::SdfPrimSpecHandle xformPrimSpec,
@@ -162,7 +159,7 @@ private:
     std::unordered_map<std::string, PXR_NS::SdfLayerRefPtr> mLayerHolders;
     std::unordered_map<std::string, std::string> mUploadedFiles;
 
-    std::unordered_map<std::string, size_t> mUniqueMaterialName;
+    NameUtils::NameCache mUniqueMaterialName;
     std::unordered_map<MaterialPtr, NameInfo> mMaterialNameInfos;
 
 

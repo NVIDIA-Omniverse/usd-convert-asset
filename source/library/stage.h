@@ -3,8 +3,8 @@
 //
 #pragma once
 
+#include "common/tiny_gltf_include.h"
 #include "pxr_includes.h"
-#include "thirdparty/tiny_gltf.h"
 #include "usd_convert_asset_internal.h"
 
 #include <memory>

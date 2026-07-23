@@ -20,9 +20,8 @@ Use this reference when validating source and destination extensions or explaini
 
 | Extension | Format |
 |-----------|--------|
-| `.usd` | Generic USD |
+| `.usd` | Binary USD crate by default; honors OpenUSD's `USD_DEFAULT_FILE_FORMAT` override (for example, `usda` selects ASCII) |
 | `.usda` | ASCII USD |
 | `.usdc` | Binary USD crate |
-| `.usdz` | Zip-packaged USD |
 
 Material, texture, and metadata sidecars such as `.mtl`, `.mdl`, image files, `.bin`, `.xml`, and `.mcx` support conversions but are not standalone CLI input assets.

@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: Copyright (c) 2019-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0 AND CC-BY-4.0
+
 -- Shared build scripts from repo_build package
 repo_build = require("omni/repo/build")
 repo_build.root = os.getcwd()
@@ -29,6 +32,7 @@ newoption {
 USD_FLAVOR = _OPTIONS["usd-flavor"]
 USD_VERSION = _OPTIONS["usd-ver"]
 PYTHON_VERSION = _OPTIONS["python-ver"]
+MONOLITHIC = USD_FLAVOR == "ov-usd"
 
 -- strip out the '.' from PYTHON_VERSION.
 PY_VER = string.gsub(PYTHON_VERSION, "%.", "")
@@ -135,13 +139,11 @@ function version_greater_than(version, target)
 end
 
 function use_draco()
-    -- For USD 24.05/25.02 flavors we use draco from usd build library for linux-aarch64. Otherwise we get draco clashes which result in invalid pointers
-    -- For USD 25.11 flavor, stock build doesn't come with draco so we would need to include it ourselves
+    -- USD 24.05/25.02 linux-aarch64 already carries Draco through USD. Linking external
+    -- Draco there loads duplicate global symbols and can cause invalid-pointer crashes.
     filter {"system:linux", "platforms:x86_64" }
-        if version_at_least(USD_VERSION, "25.11") then
-            externalincludedirs { target_deps.."/draco/%{cfg.buildcfg}/include"}
-            libdirs { target_deps.."/draco/%{cfg.buildcfg}/lib"}
-        end
+        externalincludedirs { target_deps.."/draco/%{cfg.buildcfg}/include"}
+        libdirs { target_deps.."/draco/%{cfg.buildcfg}/lib"}
         links { "draco" }
     filter {"system:linux", "platforms:aarch64" }
         if version_at_least(USD_VERSION, "25.11") then
@@ -159,12 +161,18 @@ end
 
 function use_assimp()
     includedirs {target_deps.."/assimp/include"}
+    libdirs {target_deps.."/assimp/lib"}
     filter { "system:windows" }
-        libdirs {target_deps.."/assimp/lib"}
-        links { "assimp-vc142-mt" }
+        if os.target() == "windows" then
+            local assimp_matches = os.matchfiles(target_deps.."/assimp/lib/assimp-vc*-mt.lib")
+            if #assimp_matches == 0 then
+                error("No assimp-vc*-mt.lib found in "..target_deps.."/assimp/lib")
+            end
+            links { path.getbasename(assimp_matches[1]) }
+        end
     filter { "system:linux" }
-        libdirs {target_deps.."/assimp/lib"}
         links { "assimp" }
+        linkoptions { "-Wl,-rpath-link,"..target_deps.."/draco/%{cfg.buildcfg}/lib" }
     filter {}
 end
 
@@ -181,17 +189,33 @@ function use_fbxsdk()
     filter {}
 end
 
-function use_iray()
-    includedirs {target_deps.."/iray/include"}
-    filter { "system:windows" }
-        libdirs {target_deps.."/iray/nt-x86-64/lib"}
-    filter {}
-end
 
 function use_tinyxml2()
     includedirs {target_deps.."/tinyxml2/include"}
     libdirs {target_deps.."/tinyxml2/lib"}
     links {"tinyxml2"}
+end
+
+function use_nlohmann_json()
+    externalincludedirs { target_deps.."/nlohmann_json/include" }
+end
+
+function use_stb()
+    externalincludedirs { target_deps.."/stb/include" }
+end
+
+function use_tinygltf()
+    externalincludedirs { target_deps.."/tinygltf/include" }
+end
+
+function use_tinyobjloader()
+    externalincludedirs { target_deps.."/tinyobjloader/%{cfg.buildcfg}/include" }
+    libdirs { target_deps.."/tinyobjloader/%{cfg.buildcfg}/lib" }
+    links { "tinyobjloader" }
+end
+
+function use_sha1()
+    externalincludedirs { target_deps.."/sha1" }
 end
 
 function use_python()
@@ -219,17 +243,33 @@ function use_usd(usd_libs)
     externalincludedirs { target_deps.."/usd/%{cfg.buildcfg}/include" }
     syslibdirs { target_deps.."/usd/%{cfg.buildcfg}/lib" }
 
-    usd_lib_prefix = ""
-    if _OPTIONS["linux-x86_64-cxx11-abi"] or (os.target() == "windows" and version_at_least(USD_VERSION, "25.11")) then
-        usd_lib_prefix = "usd_"
-    end
+    if MONOLITHIC then
+        -- Monolithic: link the single combined USD shared library
+        if USD_VERSION == "25.11" then
+            links { "ov_25.11usd_ms" }
+        else
+            error("Monolithic USD is only supported with USD version 25.11, but got " .. USD_VERSION)
+        end
+        -- The monolithic USD lib bundles Storm/Hydra which pull in X11 + GL.
+        -- Allow those transitive deps to remain unresolved since this project
+        -- only uses USD for geometry/material I/O, not rendering.
+        filter { "system:linux" }
+            linkoptions { "-Wl,--allow-shlib-undefined" }
+        filter {}
+    else
+        -- Non-monolithic: link individual USD libraries
+        usd_lib_prefix = ""
+        if _OPTIONS["linux-x86_64-cxx11-abi"] or os.target() == "windows" then
+            usd_lib_prefix = "usd_"
+        end
 
-    for _, lib in ipairs(usd_libs) do
-        links { usd_lib_prefix..lib }
-    end
+        for _, lib in ipairs(usd_libs) do
+            links { usd_lib_prefix..lib }
+        end
 
-    if version_greater_than(PYTHON_VERSION, "3.11") then
-        links { "usd_python" }
+        if version_greater_than(PYTHON_VERSION, "3.11") then
+            links { "usd_python" }
+        end
     end
 
     -- Link TBB libraries on Linux (USD depends on TBB)
@@ -237,6 +277,8 @@ function use_usd(usd_libs)
         links { "tbb_debug" }
     filter { "system:linux", "configurations:release" }
         links { "tbb" }
+    filter { "system:windows" }
+        externalwarnings("Off")
     filter {}
 end
 
@@ -407,7 +449,7 @@ library_headers = {
     "source/library/common/common.h",
     "source/library/common/cubicSpline.h",
     "source/library/common/curveTessellation.h",
-    "source/library/thirdparty/**.h",
+    "source/library/common/tiny_gltf_include.h",
     "source/library/exporters/assimp/*.h",
     "source/library/exporters/gltf/*.h",
     "source/library/exporters/usd/*.h",
@@ -422,7 +464,8 @@ library_headers = {
 library_sources = {
     "source/library/*.cpp",
     "source/library/common/common.cpp",
-    "source/library/thirdparty/**.cpp",
+    "source/library/common/tiny_gltf.cpp",
+    target_deps.."/sha1/sha1.cpp",
     "source/library/exporters/assimp/*.cpp",
     "source/library/exporters/gltf/*.cpp",
     "source/library/exporters/usd/*.cpp",
@@ -459,7 +502,11 @@ project "converter_library"
     use_draco()
     use_assimp()
     use_tinyxml2()
-    use_iray()
+    use_nlohmann_json()
+    use_stb()
+    use_tinygltf()
+    use_tinyobjloader()
+    use_sha1()
     use_python()
 
     -- to do: address the warnings if possible
@@ -519,6 +566,11 @@ project "test_executable"
     filter {}
     use_assimp()
     use_tinyxml2()
+    use_nlohmann_json()
+    use_stb()
+    use_tinygltf()
+    use_tinyobjloader()
+    use_sha1()
     use_python()
     use_draco()
 
@@ -550,7 +602,11 @@ project "test_suite"
     use_draco()
     use_assimp()
     use_tinyxml2()
-    use_iray()
+    use_nlohmann_json()
+    use_stb()
+    use_tinygltf()
+    use_tinyobjloader()
+    use_sha1()
     use_python()
 
     -- Enable std::experimental::filesystem for now
@@ -627,6 +683,8 @@ project "usd_convert_asset_bindings"
         end
         buildoptions { "-Wno-unused-parameter" }
         links { "stdc++fs" }
+    filter { "system:windows" }
+        externalwarnings("Off")
     filter {}
 
     links { "converter_library" }
@@ -662,8 +720,8 @@ project "usd_convert_asset_bindings"
         }
     )
 
-    -- USD 24.05/25.02 linux-aarch64 already carries Draco through USD. Packaging the external Draco can
-    -- load duplicate global Draco symbols and cause intermittent invalid-pointer crashes.
+    -- USD 24.05/25.02 linux-aarch64 already carries Draco through USD. Packaging external
+    -- Draco there loads duplicate global symbols and can cause invalid-pointer crashes.
     filter { "system:windows" }
         repo_build.prebuild_copy({
             {target_deps.."/draco/$config/bin/${lib_prefix}draco*${lib_ext}*", bindings_libs_dir},

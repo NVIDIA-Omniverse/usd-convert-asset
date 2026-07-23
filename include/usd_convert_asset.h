@@ -139,10 +139,10 @@ typedef void (*OmniConverterBlobDataDeleter)(void* buffer);
 // memory between python and c++.
 struct OmniConverterBlob
 {
-    void* buffer;
-    size_t size;
+    void* buffer = nullptr;
+    size_t size = 0;
     // Function to call to free the buffer.
-    OmniConverterBlobDataDeleter deleter;
+    OmniConverterBlobDataDeleter deleter = nullptr;
 };
 
 // Material description. It's handle to describe material as set of properties.

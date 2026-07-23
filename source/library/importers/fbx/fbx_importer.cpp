@@ -214,8 +214,17 @@ StagePtr FbxSdkImporter::ImportStage(const OmniFutureThreadContextPtr& context, 
     bool importSuccess = false;
     // Try to load file without customized IO as it has 2G size limit. Only local file is supported.
     std::error_code ec;
-    if (fs::exists(fs::u8path(localPathWithoutScheme), ec))
+    const auto localPath = fs::u8path(localPathWithoutScheme);
+    if (fs::exists(localPath, ec))
     {
+        const auto fileSize = fs::file_size(localPath, ec);
+        if (!ec && fileSize == 0)
+        {
+            detailedError = "Asset " + importAssetPath + " is empty.";
+            status = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
+            Log(detailedError);
+            return nullptr;
+        }
         importSuccess = importer->Initialize(localPathWithoutScheme.c_str());
     }
     else
@@ -225,6 +234,14 @@ StagePtr FbxSdkImporter::ImportStage(const OmniFutureThreadContextPtr& context, 
         {
             detailedError = "Failed to read asset " + importAssetPath;
             status = OmniConverterStatus::FILE_READ_ERROR;
+            Log(detailedError);
+            return nullptr;
+        }
+
+        if (!fbxBlobPtr->buffer || fbxBlobPtr->size == 0)
+        {
+            detailedError = "Asset " + importAssetPath + " is empty.";
+            status = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
             Log(detailedError);
             return nullptr;
         }

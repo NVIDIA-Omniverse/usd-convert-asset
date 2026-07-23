@@ -90,6 +90,21 @@ void OmniConverterFuture::Convert(std::shared_ptr<OmniConverterFuture::FutureThr
         return;
     }
 
+    if (!context->converterContext.IsSupportedImportAsset())
+    {
+        const std::string extension = StringUtils::ToLower(PathUtils::GetExtension(importAssetPath));
+        detailedError = "Unsupported import format";
+        if (!extension.empty())
+        {
+            detailedError += ": ." + extension;
+        }
+        detailedError += ". Supported formats: " + OmniConverterContext::GetSupportedImportFormatsForError();
+        context->converterContext.Log(detailedError);
+        context->SetDetailedError(detailedError);
+        context->SetStatus(OmniConverterStatus::UNSUPPORTED_IMPORT_FORMAT);
+        return;
+    }
+
     // Output can be anonymous layer too so all imports will be in-memory.
     std::string baseOutPath = PathUtils::GetDirName(outputAssetPath);
     if (context->converterContext.IsInMemoryOutput())

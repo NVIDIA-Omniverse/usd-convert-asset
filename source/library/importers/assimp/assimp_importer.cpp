@@ -11,13 +11,157 @@
 #include "assimp/scene.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <numeric>
+#include <string_view>
 #include <tinyxml2.h>
 
 #include "assimp/Importer.hpp"
 
 const static double FIXED_FPS = 24.0;
+
+namespace
+{
+
+std::string_view TrimAsciiPlyLine(std::string_view line)
+{
+    while (!line.empty() && std::isspace(static_cast<unsigned char>(line.front())))
+    {
+        line.remove_prefix(1);
+    }
+    while (!line.empty() && (line.back() == '\r' || std::isspace(static_cast<unsigned char>(line.back()))))
+    {
+        line.remove_suffix(1);
+    }
+    return line;
+}
+
+bool AsciiPlyLineStartsWith(std::string_view line, std::string_view prefix)
+{
+    return line.size() >= prefix.size() && line.compare(0, prefix.size(), prefix) == 0 &&
+           (line.size() == prefix.size() || std::isspace(static_cast<unsigned char>(line[prefix.size()])));
+}
+
+// Assimp's ASCII PLY loader allocates element storage from the header's declared
+// counts and zero-fills missing body rows. Reject header/body mismatches instead
+// of silently fabricating geometry.
+bool ValidateAsciiPlyElementCounts(const char* data, size_t size, std::string& error)
+{
+    if (!data || size < 3)
+    {
+        return true;
+    }
+
+    std::string_view remaining(data, size);
+    auto nextLine = [&remaining]() -> std::string_view
+    {
+        if (remaining.empty())
+        {
+            return {};
+        }
+
+        const size_t eol = remaining.find('\n');
+        std::string_view line = eol == std::string_view::npos ? remaining : remaining.substr(0, eol);
+        remaining = eol == std::string_view::npos ? std::string_view{} : remaining.substr(eol + 1);
+        return TrimAsciiPlyLine(line);
+    };
+
+    std::string_view line = nextLine();
+    if (!AsciiPlyLineStartsWith(line, "ply"))
+    {
+        return true;
+    }
+
+    bool isAscii = false;
+    bool sawFormat = false;
+    bool sawEndHeader = false;
+    size_t declaredElements = 0;
+
+    while (!remaining.empty() || !line.empty())
+    {
+        line = nextLine();
+        if (line.empty())
+        {
+            continue;
+        }
+
+        if (AsciiPlyLineStartsWith(line, "comment") || AsciiPlyLineStartsWith(line, "obj_info"))
+        {
+            continue;
+        }
+
+        if (AsciiPlyLineStartsWith(line, "format"))
+        {
+            sawFormat = true;
+            isAscii = line.find("ascii") != std::string_view::npos;
+            if (!isAscii)
+            {
+                // Binary PLY sizes depend on list properties; leave validation to Assimp.
+                return true;
+            }
+            continue;
+        }
+
+        if (AsciiPlyLineStartsWith(line, "element"))
+        {
+            const size_t lastSpace = line.find_last_of(" \t");
+            if (lastSpace == std::string_view::npos || lastSpace + 1 >= line.size())
+            {
+                error = "PLY header has an invalid element declaration.";
+                return false;
+            }
+
+            const std::string countToken(line.substr(lastSpace + 1));
+            char* endPtr = nullptr;
+            errno = 0;
+            const unsigned long long count = std::strtoull(countToken.c_str(), &endPtr, 10);
+            if (endPtr == countToken.c_str() || *endPtr != '\0' || errno == ERANGE)
+            {
+                error = "PLY header has an invalid element count.";
+                return false;
+            }
+
+            declaredElements += static_cast<size_t>(count);
+            continue;
+        }
+
+        if (AsciiPlyLineStartsWith(line, "end_header"))
+        {
+            sawEndHeader = true;
+            break;
+        }
+    }
+
+    if (!sawFormat || !isAscii || !sawEndHeader)
+    {
+        return true;
+    }
+
+    size_t bodyElements = 0;
+    while (!remaining.empty())
+    {
+        line = nextLine();
+        if (line.empty() || AsciiPlyLineStartsWith(line, "comment"))
+        {
+            continue;
+        }
+        ++bodyElements;
+    }
+
+    if (bodyElements != declaredElements)
+    {
+        error = "PLY header/body element count mismatch: header declares " + std::to_string(declaredElements) + " elements but body contains " +
+                std::to_string(bodyElements) + ".";
+        return false;
+    }
+
+    return true;
+}
+
+} // namespace
 
 
 static PXR_NS::GfMatrix4d AiMatrixToGfMatrix(const aiMatrix4x4& matrix)
@@ -84,6 +228,33 @@ StagePtr AssimpImporter::ImportStage(const OmniFutureThreadContextPtr& context, 
     const std::string importAssetPath = mThreadContext->converterContext.GetImportAssetPath();
 
     Log("Starting to import asset with Assimp importer.");
+
+    auto importAssetBlob = mThreadContext->converterContext.ReadFile(importAssetPath);
+    if (!importAssetBlob)
+    {
+        detailedError = "Failed to read asset " + importAssetPath + ".";
+        status = OmniConverterStatus::FILE_READ_ERROR;
+        Log(detailedError);
+        return nullptr;
+    }
+
+    if (!importAssetBlob->buffer || importAssetBlob->size == 0)
+    {
+        detailedError = "Asset " + importAssetPath + " is empty.";
+        status = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
+        Log(detailedError);
+        return nullptr;
+    }
+
+    if (mThreadContext->converterContext.GetImportAssetType() == AssetType::PLY)
+    {
+        if (!ValidateAsciiPlyElementCounts(static_cast<const char*>(importAssetBlob->buffer), importAssetBlob->size, detailedError))
+        {
+            status = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
+            Log(detailedError);
+            return nullptr;
+        }
+    }
 
     static auto propsDeleter = [](aiPropertyStore* props)
     {
@@ -259,6 +430,7 @@ StagePtr AssimpImporter::ImportStage(const OmniFutureThreadContextPtr& context, 
     assimpFileIOContext.context = &mThreadContext->converterContext;
     assimpFileIOContext.status = &status;
     assimpFileIOContext.detailedError = &detailedError;
+    assimpFileIOContext.cachedBlobs.insert({ importAssetPath, importAssetBlob });
 
     aiFileIO fileIO;
     fileIO.OpenProc = assimpFileOpenProc;

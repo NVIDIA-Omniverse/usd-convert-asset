@@ -19,14 +19,29 @@ This module contains bindings and helpers to usd_convert_asset interface. You ca
 import asyncio
 import ctypes
 import glob
+import logging
 import os
 import platform
 import sys
 import traceback
+from pathlib import Path
+
+from ._bootstrap import check_pxr_conflict as _check_pxr_conflict
 
 _module_dir = os.path.dirname(__file__)
 _libs_dir = os.path.join(_module_dir, "libs")
 _dll_directory_handles = []
+_logger = logging.getLogger(__name__)
+
+# Warn when a foreign OpenUSD (pxr) copy was imported before us. Python keeps the
+# already-loaded pxr module instead of reloading our bundled build, but mixing USD
+# versions in one process can still corrupt shared Tf/Plug singletons. Run this
+# before preloading any USD-linked native library below. The bundled pxr can land
+# under either python-path layout, so pass both candidates.
+_check_pxr_conflict(
+    os.path.join(_libs_dir, "python", "pxr"),
+    os.path.join(_libs_dir, "lib", "python", "pxr"),
+)
 
 
 def _prepend_env_path(name, path):
@@ -77,40 +92,6 @@ def _preload_bundled_draco():
             return
 
 
-def _get_bundled_usd_version():
-    build_info_path = os.path.join(_module_dir, "_build_info.txt")
-    if os.path.isfile(build_info_path):
-        with open(build_info_path, "r", encoding="utf-8") as build_info:
-            usd_version = build_info.read().strip()
-        if usd_version:
-            return usd_version
-
-    try:
-        from pxr import Usd
-
-        version = tuple(Usd.GetVersion())
-        if len(version) >= 3:
-            major, minor, patch = version[:3]
-            if major == 0:
-                return f"{minor}.{patch:02d}"
-            return f"{major}.{minor:02d}"
-        if len(version) >= 2:
-            major, minor = version[:2]
-            return f"{major}.{minor:02d}"
-    except (AttributeError, ImportError):
-        return None
-
-    return None
-
-
-def _should_preload_bundled_draco():
-    machine = platform.machine().lower()
-    usd_version = _get_bundled_usd_version()
-    if machine in ("aarch64", "arm64"):
-        return usd_version not in (None, "24.05", "25.02")
-    return True
-
-
 def _preload_bundled_library(library_name):
     library_path = os.path.join(_libs_dir, library_name)
     if os.path.isfile(library_path):
@@ -127,13 +108,15 @@ if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
 
 # preload dep libs into the process
 if sys.platform == "win32":
-    ctypes.WinDLL(os.path.join(_libs_dir, "assimp-vc142-mt.dll"))
+    _assimp_dlls = sorted(Path(_libs_dir).glob("assimp-vc*-mt.dll"))
+    if not _assimp_dlls:
+        raise FileNotFoundError(f"No assimp-vc*-mt.dll found in {_libs_dir}")
+    ctypes.WinDLL(str(_assimp_dlls[-1]))
     ctypes.WinDLL(os.path.join(_libs_dir, "libfbxsdk.dll"))
     ctypes.WinDLL(os.path.join(_libs_dir, "usd_convert_asset.dll"))
 elif sys.platform == "linux":
     _preload_bundled_libpython()
-    if _should_preload_bundled_draco():
-        _preload_bundled_draco()
+    _preload_bundled_draco()
     ctypes.CDLL(os.path.join(_libs_dir, "libassimp.so"))
     ctypes.CDLL(os.path.join(_libs_dir, "libxml2.so"), mode=ctypes.RTLD_GLOBAL)
     _preload_bundled_library("libusd_usdUI.so")

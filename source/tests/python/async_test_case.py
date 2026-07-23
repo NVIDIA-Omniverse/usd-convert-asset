@@ -47,6 +47,7 @@ class AsyncTestCase(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         self.outputs_dir = omni.repo.man.resolve_tokens("${root}/_build/${platform}/${config}/tests/output")
+        os.makedirs(self.outputs_dir, exist_ok=True)
         assetconverter.OmniAssetConverter.set_log_callback(log_print)
 
     def tearDown(self):
@@ -93,11 +94,11 @@ class AsyncTestCase(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result.issues(), msg=result.issues())
 
-    def get_output_path(self, input_path, override_base_name=None):
+    def get_output_path(self, input_path, override_base_name=None, output_extension=".usd"):
         if override_base_name:
-            output_path = self.outputs_dir + "/" + override_base_name + ".usd"
+            output_path = self.outputs_dir + "/" + override_base_name + output_extension
         else:
             filename = os.path.basename(input_path)
             base_name = os.path.splitext(filename)[0]
-            output_path = self.outputs_dir + "/" + base_name + ".usd"
+            output_path = self.outputs_dir + "/" + base_name + output_extension
         return output_path

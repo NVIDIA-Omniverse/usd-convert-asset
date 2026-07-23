@@ -117,7 +117,7 @@ python -m pip install --upgrade pip
 python -m pip install dist/usd_convert_asset-<version>-<python>-<abi>-<platform>.whl
 usd-convert-asset --help
 usd-convert-asset -i path/to/input.fbx -o path/to/output.usda
-python -m usd_convert_asset -i path/to/input.obj -o path/to/output.usdz
+python -m usd_convert_asset -i path/to/input.obj -o path/to/output.usdc
 ```
 
 To test the staged package tree before building a wheel, install the generated

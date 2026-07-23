@@ -4,11 +4,11 @@
 #include "gltf_importer.h"
 
 #include "../../common/common.h"
-#include "../../thirdparty/stb_image.h"
 #include "../../utils/utils.h"
 #include "gltf_loader_util.h"
 
-#include "../../thirdparty/sha1.hpp"
+#include <sha1.hpp>
+#include <stb_image.h>
 
 using namespace omni::assetconverter::importer::gltf;
 
@@ -21,6 +21,109 @@ using namespace omni::assetconverter::importer::gltf;
 static bool InRange(size_t value, size_t low, size_t high)
 {
     return (value >= low && value < high);
+}
+
+static size_t GetGltfComponentSize(int componentType)
+{
+    switch (componentType)
+    {
+        case TINYGLTF_COMPONENT_TYPE_BYTE:
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
+            return 1;
+        case TINYGLTF_COMPONENT_TYPE_SHORT:
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
+            return 2;
+        case TINYGLTF_COMPONENT_TYPE_INT:
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT:
+        case TINYGLTF_COMPONENT_TYPE_FLOAT:
+            return 4;
+        case TINYGLTF_COMPONENT_TYPE_DOUBLE:
+            return 8;
+        default:
+            return 0;
+    }
+}
+
+static size_t GetGltfTypeComponentCount(int type)
+{
+    switch (type)
+    {
+        case TINYGLTF_TYPE_SCALAR:
+            return 1;
+        case TINYGLTF_TYPE_VEC2:
+            return 2;
+        case TINYGLTF_TYPE_VEC3:
+            return 3;
+        case TINYGLTF_TYPE_VEC4:
+        case TINYGLTF_TYPE_MAT2:
+            return 4;
+        case TINYGLTF_TYPE_MAT3:
+            return 9;
+        case TINYGLTF_TYPE_MAT4:
+            return 16;
+        default:
+            return 0;
+    }
+}
+
+static bool ValidateGltfAccessorExtents(const tinygltf::Model& model, std::string& error)
+{
+    for (size_t accessorIndex = 0; accessorIndex < model.accessors.size(); ++accessorIndex)
+    {
+        const auto& accessor = model.accessors[accessorIndex];
+
+        // An omitted bufferView is valid for sparse accessors. Existing import
+        // paths handle unsupported sparse/Draco data without dereferencing it.
+        if (accessor.bufferView < 0)
+        {
+            continue;
+        }
+
+        if (accessor.bufferView >= static_cast<int>(model.bufferViews.size()))
+        {
+            error = "glTF accessor " + std::to_string(accessorIndex) + " references an invalid bufferView.";
+            return false;
+        }
+
+        const auto& bufferView = model.bufferViews[accessor.bufferView];
+        if (bufferView.buffer < 0 || bufferView.buffer >= static_cast<int>(model.buffers.size()))
+        {
+            error = "glTF accessor " + std::to_string(accessorIndex) + " references an invalid buffer.";
+            return false;
+        }
+
+        const auto& buffer = model.buffers[bufferView.buffer];
+        if (bufferView.byteOffset > buffer.data.size() || bufferView.byteLength > buffer.data.size() - bufferView.byteOffset)
+        {
+            error = "glTF bufferView for accessor " + std::to_string(accessorIndex) + " exceeds its buffer.";
+            return false;
+        }
+
+        if (accessor.byteOffset > bufferView.byteLength)
+        {
+            error = "glTF accessor " + std::to_string(accessorIndex) + " starts outside its bufferView.";
+            return false;
+        }
+
+        const int byteStride = accessor.ByteStride(bufferView);
+        const size_t componentSize = GetGltfComponentSize(accessor.componentType);
+        const size_t componentCount = GetGltfTypeComponentCount(accessor.type);
+        if (byteStride <= 0 || componentSize == 0 || componentCount == 0)
+        {
+            error = "glTF accessor " + std::to_string(accessorIndex) + " has an invalid element layout.";
+            return false;
+        }
+
+        const size_t elementSize = componentSize * componentCount;
+        const size_t available = bufferView.byteLength - accessor.byteOffset;
+        if (accessor.count > 0 && (elementSize > available || accessor.count - 1 > (available - elementSize) / static_cast<size_t>(byteStride)))
+        {
+            error = "glTF accessor " + std::to_string(accessorIndex) + " exceeds its bufferView.";
+            return false;
+        }
+    }
+
+    return true;
 }
 
 static TextureWrapMode ToTextureWrapMode(int wrapMode)
@@ -794,7 +897,21 @@ std::string GltfImporter::ComputeHash(const OmniFutureThreadContextPtr& context)
     OmniConverterBlobPtr fileBlob = mThreadContext->converterContext.ReadFile(importAssetPath);
     if (!fileBlob)
     {
-        Log("Failed to read asset file " + importAssetPath + " since it's not existed.");
+        mModelLoadError = "Failed to read asset " + importAssetPath + ".";
+        Log(mModelLoadError);
+        mModelLoadStatus = OmniConverterStatus::FILE_READ_ERROR;
+        mModelLoadedSuccessfully = false;
+        mModelLoaded = true;
+        return {};
+    }
+
+    if (!fileBlob->buffer || fileBlob->size == 0)
+    {
+        mModelLoadError = "Asset " + importAssetPath + " is empty.";
+        Log(mModelLoadError);
+        mModelLoadStatus = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
+        mModelLoadedSuccessfully = false;
+        mModelLoaded = true;
         return {};
     }
 
@@ -957,6 +1074,14 @@ std::string GltfImporter::ComputeHash(const OmniFutureThreadContextPtr& context)
 
     if (mModelLoadedSuccessfully)
     {
+        if (!ValidateGltfAccessorExtents(mGltfModel, mModelLoadError))
+        {
+            Log(mModelLoadError);
+            mModelLoadStatus = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
+            mModelLoadedSuccessfully = false;
+            return {};
+        }
+
         // Mixing flags also so that it will take flags into consideration.
         sha1.update(std::to_string(mThreadContext->converterContext.GetFlags()));
 
@@ -990,7 +1115,7 @@ StagePtr GltfImporter::ImportStage(const OmniFutureThreadContextPtr& context, Om
     if (!mModelLoadedSuccessfully)
     {
         detailedError = mModelLoadError;
-        status = OmniConverterStatus::FILE_READ_ERROR;
+        status = mModelLoadStatus;
         return nullptr;
     }
 

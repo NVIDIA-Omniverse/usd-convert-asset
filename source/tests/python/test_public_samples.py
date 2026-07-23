@@ -57,6 +57,11 @@ class TestPublicSamples(AsyncTestCase):
                 print(f"Skipping public assimp sample: {format_path_for_log(file_path)}", flush=True)
                 continue
 
+            # intentionally malformed accessors / bufferViews
+            if "IncorrectVertexArrays" in file_path:
+                print(f"Skipping public assimp sample: {format_path_for_log(file_path)}", flush=True)
+                continue
+
             # file has invalid header (unable to load in Blender as well)
             if "transparentTest.fbx" in file_path:
                 print(f"Skipping public assimp sample: {format_path_for_log(file_path)}", flush=True)

@@ -9,13 +9,18 @@ class UsdConvertAssetDependencies(ConanFile):
     settings = "os", "arch", "compiler", "build_type"
 
     requires = (
-        "assimp/5.4.3",
+        "assimp/6.0.2",
         "libxml2/2.14.5",
         "draco/1.5.6",
         "tinyxml2/11.0.0",
         "doctest/2.4.12",
         "pybind11/2.13.6",
+        "tinygltf/2.9.7",
+        "tinyobjloader/2.0.0-rc10",
     )
+
+    def requirements(self):
+        self.requires("stb/cci.20240531", override=True)
 
     default_options = {
         "assimp/*:shared": True,

@@ -130,6 +130,15 @@ StagePtr ObjImporter::ImportStage(const OmniFutureThreadContextPtr& context, Omn
         detailedError = "Failed to read " + importAssetPath + ".";
         Log(detailedError);
         status = OmniConverterStatus::FILE_NOT_EXISTED;
+        return nullptr;
+    }
+
+    if (!objBlob->buffer || objBlob->size == 0)
+    {
+        detailedError = "Asset " + importAssetPath + " is empty.";
+        Log(detailedError);
+        status = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
+        return nullptr;
     }
 
     std::string objData((const char*)objBlob->buffer, objBlob->size);
@@ -183,9 +192,25 @@ StagePtr ObjImporter::ImportStage(const OmniFutureThreadContextPtr& context, Omn
         allPoints[i] = PXR_NS::GfVec3f(vx, vy, vz);
     }
 
-    auto GetPoint = [&allPoints](const tinyobj::shape_t& shape, const tinyobj::attrib_t& attributes, size_t index)
+    // tinyobjloader's fixIndex() converts a positive OBJ face index i to (i - 1) with no upper-bound
+    // clamp against the declared attribute counts. A crafted .obj can therefore reference indices far
+    // beyond the number of declared vertices/normals/texcoords/colors, so every attribute read below
+    // must be validated to avoid out-of-bounds heap access on this attacker-controlled import path.
+    const size_t numNormals = attributes.normals.size() / 3;
+    const size_t numTexcoords = attributes.texcoords.size() / 2;
+    const size_t numColors = attributes.colors.size() / 3;
+
+    auto GetPoint = [&allPoints, numPoints](const tinyobj::shape_t& shape, size_t index) -> PXR_NS::GfVec3f
     {
+        if (index >= shape.mesh.indices.size())
+        {
+            return PXR_NS::GfVec3f(0.0f);
+        }
         tinyobj::index_t idx = shape.mesh.indices[index];
+        if (idx.vertex_index < 0 || size_t(idx.vertex_index) >= numPoints)
+        {
+            return PXR_NS::GfVec3f(0.0f);
+        }
         return allPoints[idx.vertex_index];
     };
 
@@ -206,6 +231,8 @@ StagePtr ObjImporter::ImportStage(const OmniFutureThreadContextPtr& context, Omn
         std::unordered_map<size_t, MeshInfo> subsetMeshes; // Group mesh with materials
         size_t numFaces = shape.mesh.num_face_vertices.size();
         size_t indexOffset = 0;
+        size_t skippedIndexOffsetFaces = 0;
+        size_t skippedAttributeIndexFaces = 0;
         for (size_t f = 0; f < numFaces; f++)
         {
             size_t materialId = shape.mesh.material_ids[f];
@@ -264,6 +291,46 @@ StagePtr ObjImporter::ImportStage(const OmniFutureThreadContextPtr& context, Omn
             auto& mesh = meshInfo.mesh;
             auto& meshUniqueIndices = meshInfo.uniqueIndices;
             size_t fv = size_t(shape.mesh.num_face_vertices[f]);
+
+            // A corrupted num_face_vertices can claim more corners than the indices array holds.
+            // Guard the indices access itself before validating the attribute indices it points to.
+            if (indexOffset + fv > shape.mesh.indices.size())
+            {
+                ++skippedIndexOffsetFaces;
+                indexOffset += fv;
+                continue;
+            }
+
+            // Validate every attribute index referenced by this face before emitting any geometry.
+            // Skipping the whole face (rather than an individual corner) keeps faceVertexCounts,
+            // normals, uvs, and colors consistent for the mesh.
+            bool faceValid = true;
+            for (size_t v = 0; v < fv; v++)
+            {
+                const tinyobj::index_t& idx = shape.mesh.indices[indexOffset + v];
+                if (idx.vertex_index < 0 || size_t(idx.vertex_index) >= numPoints)
+                {
+                    faceValid = false;
+                    break;
+                }
+                if (idx.normal_index >= 0 && size_t(idx.normal_index) >= numNormals)
+                {
+                    faceValid = false;
+                    break;
+                }
+                if (idx.texcoord_index >= 0 && size_t(idx.texcoord_index) >= numTexcoords)
+                {
+                    faceValid = false;
+                    break;
+                }
+            }
+            if (!faceValid)
+            {
+                ++skippedAttributeIndexFaces;
+                indexOffset += fv;
+                continue;
+            }
+
             mesh->faceVertexCounts.push_back(fv);
             for (size_t v = 0; v < fv; v++)
             {
@@ -281,9 +348,9 @@ StagePtr ObjImporter::ImportStage(const OmniFutureThreadContextPtr& context, Omn
                 }
                 else // It's possible that part of the subset does not have normals
                 {
-                    auto v0 = GetPoint(shape, attributes, indexOffset);
-                    auto v1 = GetPoint(shape, attributes, indexOffset + 1);
-                    auto v2 = GetPoint(shape, attributes, indexOffset + 2);
+                    auto v0 = GetPoint(shape, indexOffset);
+                    auto v1 = GetPoint(shape, indexOffset + 1);
+                    auto v2 = GetPoint(shape, indexOffset + 2);
                     auto normal = (v1 - v0) ^ (v2 - v0);
                     mesh->normals.push_back(normal);
                 }
@@ -315,11 +382,24 @@ StagePtr ObjImporter::ImportStage(const OmniFutureThreadContextPtr& context, Omn
             }
             indexOffset += fv;
         }
+
+        const size_t skippedFaces = skippedIndexOffsetFaces + skippedAttributeIndexFaces;
+        if (skippedFaces > 0)
+        {
+            Log("Skipping " + std::to_string(skippedFaces) + " invalid OBJ face(s) in " + importAssetPath + ".");
+        }
+
         faceIndexOffset += numFaces;
 
         for (const auto& subsetMesh : subsetMeshes)
         {
             const auto& meshInfo = subsetMesh.second;
+
+            // Every face for this material may have been skipped as invalid; don't emit empty meshes.
+            if (meshInfo.mesh->faceVertexCounts.empty())
+            {
+                continue;
+            }
 
             // re-order the face vertex indices and add mesh point
             std::unordered_map<size_t, size_t> indiceMap;
