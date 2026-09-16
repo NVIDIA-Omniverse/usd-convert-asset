@@ -882,13 +882,40 @@ tinygltf::Mesh GltfExporter::ToTinygltfMesh(tinygltf::Model& model, const StageP
         std::vector<size_t> outputFaceIndices;
         for (size_t i = 0; i < geomsubset.faceIndices.size(); i++)
         {
-            size_t faceIndex = geomsubset.faceIndices[i];
-            size_t faceVerticesCount = mesh->faceVertexCounts[faceIndex];
+            const int faceIndexValue = geomsubset.faceIndices[i];
+            if (faceIndexValue < 0 || static_cast<size_t>(faceIndexValue) >= mesh->faceVertexCounts.size())
+            {
+                continue;
+            }
+
+            const size_t faceIndex = static_cast<size_t>(faceIndexValue);
+            const int faceVerticesCountValue = mesh->faceVertexCounts[faceIndex];
+
+            // Skip lines, points, and invalid face counts.
+            if (faceVerticesCountValue < 3)
+            {
+                continue;
+            }
+
+            const size_t faceVerticesCount = static_cast<size_t>(faceVerticesCountValue);
             size_t endIndex = faceVertexIndexEnd[faceIndex];
+            if (endIndex < faceVerticesCount || endIndex > mesh->faceVertexIndices.size())
+            {
+                continue;
+            }
             size_t startIndex = endIndex - faceVerticesCount;
 
-            // Skip lines or values
-            if (faceVerticesCount < 3)
+            bool hasInvalidPointIndex = false;
+            for (size_t j = 0; j < faceVerticesCount; j++)
+            {
+                const int pointIndexValue = mesh->faceVertexIndices[startIndex + j];
+                if (pointIndexValue < 0 || static_cast<size_t>(pointIndexValue) >= mesh->points.size())
+                {
+                    hasInvalidPointIndex = true;
+                    break;
+                }
+            }
+            if (hasInvalidPointIndex)
             {
                 continue;
             }

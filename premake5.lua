@@ -160,13 +160,22 @@ function use_draco()
 end
 
 function use_assimp()
-    includedirs {target_deps.."/assimp/include"}
-    libdirs {target_deps.."/assimp/lib"}
+    includedirs {target_deps.."/assimp/%{cfg.buildcfg}/include"}
+    libdirs {target_deps.."/assimp/%{cfg.buildcfg}/lib"}
     filter { "system:windows" }
         if os.target() == "windows" then
-            local assimp_matches = os.matchfiles(target_deps.."/assimp/lib/assimp-vc*-mt.lib")
+            -- os.matchfiles runs at generation time and cannot expand %{cfg.buildcfg}. Only the
+            -- basename is needed for links{} and it is identical across configs, so probe the
+            -- config folders and let libdirs above resolve the per-config import library.
+            local assimp_matches = {}
+            for _, assimp_config in ipairs({"release", "debug"}) do
+                assimp_matches = os.matchfiles(target_deps.."/assimp/"..assimp_config.."/lib/assimp-vc*-mt.lib")
+                if #assimp_matches > 0 then
+                    break
+                end
+            end
             if #assimp_matches == 0 then
-                error("No assimp-vc*-mt.lib found in "..target_deps.."/assimp/lib")
+                error("No assimp-vc*-mt.lib found in "..target_deps.."/assimp/<config>/lib")
             end
             links { path.getbasename(assimp_matches[1]) }
         end
@@ -191,8 +200,8 @@ end
 
 
 function use_tinyxml2()
-    includedirs {target_deps.."/tinyxml2/include"}
-    libdirs {target_deps.."/tinyxml2/lib"}
+    includedirs {target_deps.."/tinyxml2/%{cfg.buildcfg}/include"}
+    libdirs {target_deps.."/tinyxml2/%{cfg.buildcfg}/lib"}
     links {"tinyxml2"}
 end
 
@@ -544,7 +553,7 @@ project "converter_library"
 
     files { "include/*.h" }
 
-    -- we do not support fbx conversion on aarch64 platform
+    -- The FBX SDK importer is unavailable on aarch64; Assimp handles FBX there.
     filter {"system:windows"}
         files { fbx_headers, fbx_sources }
     filter {"system:linux", "platforms:x86_64" }
@@ -657,7 +666,7 @@ project "test_suite"
 
     files { "source/tests/cpp/**.cpp" }
 
-    -- we do not support fbx conversion on aarch64 platform
+    -- The FBX SDK importer is unavailable on aarch64; Assimp handles FBX there.
     filter {"system:windows"}
         files { fbx_headers, fbx_sources }
     filter {"system:linux", "platforms:x86_64" }
@@ -701,11 +710,11 @@ project "usd_convert_asset_bindings"
     repo_build.prebuild_copy (
         {
             -- windows dll in bin
-            {target_deps.."/assimp/bin/${lib_prefix}assimp*${lib_ext}*", bindings_libs_dir},
+            {target_deps.."/assimp/$config/bin/${lib_prefix}assimp*${lib_ext}*", bindings_libs_dir},
             -- linux-x86_64 .so in lib64
-            {target_deps.."/assimp/lib64/${lib_prefix}assimp*${lib_ext}*", bindings_libs_dir},
+            {target_deps.."/assimp/$config/lib64/${lib_prefix}assimp*${lib_ext}*", bindings_libs_dir},
             -- linux-aarch64 .so in lib
-            {target_deps.."/assimp/lib/${lib_prefix}assimp*${lib_ext}*", bindings_libs_dir},
+            {target_deps.."/assimp/$config/lib/${lib_prefix}assimp*${lib_ext}*", bindings_libs_dir},
             {target_deps.."/libxml2/$config/lib/${lib_prefix}xml2*${lib_ext}*", bindings_libs_dir},
 
             -- fbxsdk on Windows
@@ -714,9 +723,9 @@ project "usd_convert_asset_bindings"
             {target_deps.."/fbxsdk/lib/$config/*${lib_ext}", bindings_libs_dir},
 
             -- tinyxml2 on Windows
-            {target_deps.."/tinyxml2/bin/*${lib_ext}*", bindings_libs_dir },
+            {target_deps.."/tinyxml2/$config/bin/*${lib_ext}*", bindings_libs_dir },
             -- tinyxml2 on Linux
-            {target_deps.."/tinyxml2/lib/*${lib_ext}*", bindings_libs_dir },
+            {target_deps.."/tinyxml2/$config/lib/*${lib_ext}*", bindings_libs_dir },
         }
     )
 
@@ -785,21 +794,3 @@ project "usd_convert_asset_usd_plugin"
 
 -- Create pip package staging layout
 include("source/python/premake5.lua")
-
--- Copy some dlls to run tests locally from executable
---[=====[
-repo_build.prebuild_copy (
-    {
-        {target_deps.."/usd/%{cfg.buildcfg}/lib/${lib_prefix}*${lib_ext}*", target_build_dir.."/bin"},
-        {target_deps.."/usd/%{cfg.buildcfg}/bin/${lib_prefix}*${lib_ext}*", target_build_dir.."/bin"},
-        {target_deps.."/python/lib/${lib_prefix}*${lib_ext}*", target_build_dir.."/bin"},
-        {target_deps.."/python/${lib_prefix}*${lib_ext}*", target_build_dir.."/bin"},
-
-        {target_deps.."/usd/%{cfg.buildcfg}/lib/usd", target_build_dir.."/bin/usd"},
-        {target_deps.."/fbxsdk/lib/x64/%{cfg.buildcfg}/${lib_prefix}*${lib_ext}*", target_build_dir.."/bin"},
-        {target_deps.."/assimp/bin/${lib_prefix}*${lib_ext}*", target_build_dir.."/bin"},
-        {target_deps.."/tinyxml2/bin/${lib_prefix}*${lib_ext}*", target_build_dir.."/bin"},
-        {target_deps.."/draco/%{cfg.buildcfg}/bin/${lib_prefix}*${lib_ext}*", target_build_dir.."/bin"},
-    }
-)
---]=====]

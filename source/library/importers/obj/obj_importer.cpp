@@ -7,8 +7,109 @@
 #include "../../utils/utils.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <numeric>
+#include <string_view>
+
+namespace
+{
+// tinyobjloader's tryParseDouble() only accepts digit-based floats. Tokens like
+// "nan" / "inf" fail parse and silently fall back to 0.0, so a post-LoadObj
+// isfinite() check never sees them. Scan raw vertex-attribute lines with
+// strtod(), which does recognize non-finite literals.
+bool ObjDataHasNonFiniteVertexAttributes(std::string_view objData)
+{
+    auto isSpace = [](char c)
+    {
+        return c == ' ' || c == '\t';
+    };
+
+    size_t offset = 0;
+    while (offset < objData.size())
+    {
+        const size_t lineEnd = objData.find_first_of("\r\n", offset);
+        std::string_view line = lineEnd == std::string_view::npos ? objData.substr(offset) : objData.substr(offset, lineEnd - offset);
+        if (lineEnd == std::string_view::npos)
+        {
+            offset = objData.size();
+        }
+        else if (objData[lineEnd] == '\r' && lineEnd + 1 < objData.size() && objData[lineEnd + 1] == '\n')
+        {
+            offset = lineEnd + 2;
+        }
+        else
+        {
+            offset = lineEnd + 1;
+        }
+
+        size_t cursor = 0;
+        while (cursor < line.size() && isSpace(line[cursor]))
+        {
+            ++cursor;
+        }
+        if (cursor >= line.size() || line[cursor] == '#')
+        {
+            continue;
+        }
+
+        // Match "v ", "vn ", or "vt " attribute lines only.
+        const char first = line[cursor];
+        if (first != 'v')
+        {
+            continue;
+        }
+
+        size_t keywordEnd = cursor + 1;
+        if (keywordEnd < line.size() && (line[keywordEnd] == 'n' || line[keywordEnd] == 't'))
+        {
+            ++keywordEnd;
+        }
+        if (keywordEnd >= line.size() || !isSpace(line[keywordEnd]))
+        {
+            // Reject "usemtl", "vp", etc., and bare "v"/"vn"/"vt" with no values.
+            continue;
+        }
+
+        // Copy the remainder so strtod can see a NUL-terminated buffer.
+        const std::string values(line.substr(keywordEnd));
+        const char* token = values.c_str();
+        while (*token != '\0')
+        {
+            while (isSpace(*token))
+            {
+                ++token;
+            }
+            if (*token == '\0' || *token == '#')
+            {
+                break;
+            }
+
+            char* parseEnd = nullptr;
+            errno = 0;
+            const double value = std::strtod(token, &parseEnd);
+            if (parseEnd == token)
+            {
+                // Not a float token; skip to next whitespace-separated token.
+                while (*token != '\0' && !isSpace(*token) && *token != '#')
+                {
+                    ++token;
+                }
+                continue;
+            }
+
+            if (errno == ERANGE || !std::isfinite(value))
+            {
+                return true;
+            }
+            token = parseEnd;
+        }
+    }
+
+    return false;
+}
+} // namespace
 
 class OmniConverterMaterialReader : public tinyobj::MaterialReader
 {
@@ -142,6 +243,14 @@ StagePtr ObjImporter::ImportStage(const OmniFutureThreadContextPtr& context, Omn
     }
 
     std::string objData((const char*)objBlob->buffer, objBlob->size);
+    if (ObjDataHasNonFiniteVertexAttributes(objData))
+    {
+        detailedError = "Asset " + importAssetPath + " contains non-finite vertex attribute values.";
+        Log(detailedError);
+        status = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
+        return nullptr;
+    }
+
     std::istringstream sourceStream(objData);
 
     OmniConverterMaterialReader materialReader(mThreadContext->converterContext);
@@ -180,6 +289,26 @@ StagePtr ObjImporter::ImportStage(const OmniFutureThreadContextPtr& context, Omn
     if (mThreadContext->converterContext.ConvertUpZ())
     {
         stage->yAxis = false;
+    }
+
+    auto hasNonFinite = [](const std::vector<tinyobj::real_t>& values)
+    {
+        return std::any_of(
+            values.begin(),
+            values.end(),
+            [](tinyobj::real_t value)
+            {
+                return !std::isfinite(value);
+            }
+        );
+    };
+    if (hasNonFinite(attributes.vertices) || hasNonFinite(attributes.normals) || hasNonFinite(attributes.texcoords) ||
+        hasNonFinite(attributes.colors))
+    {
+        detailedError = "Asset " + importAssetPath + " contains non-finite vertex attribute values.";
+        Log(detailedError);
+        status = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
+        return nullptr;
     }
 
     size_t numPoints = attributes.vertices.size() / 3;

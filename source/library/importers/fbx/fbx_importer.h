@@ -6,6 +6,7 @@
 #include "../importer.h"
 
 #include <fbxsdk.h>
+#include <unordered_set>
 
 class FbxSdkImporter : public Importer
 {
@@ -32,6 +33,7 @@ private:
     void PopulateAllMeshes(fbxsdk::FbxScene* scene, const StagePtr& stage, double scale, fbxsdk::FbxGeometryConverter& converter);
     MeshPtr PopulateMesh(fbxsdk::FbxScene* scene, fbxsdk::FbxMesh* fbxMesh, const StagePtr& stage, double scale, bool mergeMeshChildren);
     MeshPtr PopulateMeshInternal(fbxsdk::FbxScene* scene, fbxsdk::FbxMesh* fbxMesh, const StagePtr& stage, double scale);
+    CurvePtr PopulateNurbsCurve(fbxsdk::FbxNode* currentNode, fbxsdk::FbxNurbsCurve* fbxCurve, double scale);
     void PopulateCamera(fbxsdk::FbxScene* scene, fbxsdk::FbxNode* currentNode, const StagePtr& stage, const StageNodePtr& stageNode, double scale);
     void PopulateLight(fbxsdk::FbxScene* scene, fbxsdk::FbxNode* currentNode, const StagePtr& stage, const StageNodePtr& stageNode);
     void PopulateSubsets(const fbxsdk::FbxMesh* fbxMesh, const StagePtr& stage, const MeshPtr& mesh);
@@ -65,6 +67,7 @@ private:
     bool AreTransformOpsSupported(fbxsdk::FbxNode* node);
     bool HasGeometricTransforms(fbxsdk::FbxNode* node);
     void BakingScales(const StagePtr& stage);
+    void LogNurbsCurveSummary();
 
 private:
 
@@ -90,6 +93,8 @@ private:
 
     OmniFutureThreadContextPtr mThreadContext;
     std::unordered_map<fbxsdk::FbxMesh*, size_t> mFbxMeshToMeshIndex;
+    std::unordered_map<fbxsdk::FbxNurbsCurve*, size_t> mFbxNurbsCurveToCurveIndex;
+    std::unordered_set<fbxsdk::FbxNurbsCurve*> mFailedNurbsCurves;
     std::unordered_map<fbxsdk::FbxSurfaceMaterial*, size_t> mFbxMaterialToMaterialIndex;
     std::vector<StageNodePtr> mBoneList;
     std::unordered_map<fbxsdk::FbxObject*, size_t> mNodeBoneIndex;
@@ -100,4 +105,6 @@ private:
 
 
     std::vector<MeshInfo> mMeshInfos;
+    size_t mImportedNurbsCurveCount = 0;
+    size_t mDroppedNurbsCurveCount = 0;
 };

@@ -12,10 +12,14 @@ import os
 import signal
 import sys
 import threading
+from contextlib import nullcontext
+from pathlib import Path
 from typing import Any, TextIO
 
+from usd_convert_asset import usdz
+
 _SUPPORTED_INPUT_EXTENSIONS = (".fbx", ".obj", ".gltf", ".glb", ".stl", ".ply")
-_SUPPORTED_OUTPUT_EXTENSIONS = (".usd", ".usda", ".usdc")
+_SUPPORTED_OUTPUT_EXTENSIONS = (".usd", ".usda", ".usdc", ".usdz")
 
 # Windows STATUS_CONTROL_C_EXIT. POSIX uses conventional 128+SIGINT.
 _INTERRUPT_EXIT_CODE = 0xC000013A if sys.platform == "win32" else 130
@@ -30,17 +34,43 @@ _console_ctrl_handler_installed = False
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert 3D assets to USD with usd-convert-asset.")
     parser.add_argument("-i", "--input", required=True, help="Input asset file path.")
-    parser.add_argument("-o", "--output", required=True, help="Output USD file path (.usd, .usda, or .usdc).")
+    parser.add_argument(
+        "-o",
+        "--output",
+        required=True,
+        help="Output USD file path (.usd, .usda, .usdc, or .usdz).",
+    )
     parser.add_argument("--ignore-materials", action="store_true", help="Do not export materials.")
     parser.add_argument("--ignore-animation", action="store_true", help="Do not export animation.")
-    parser.add_argument("--single-mesh", action="store_true", help="Export a single mesh USD file.")
-    parser.add_argument("--smooth-normals", action="store_true", help="Generate smooth normals for meshes.")
+    parser.add_argument(
+        "--single-props-file",
+        action="store_true",
+        help=(
+            "Write repeated mesh prototypes to one props USD file instead of separate mesh USD files. "
+            "Does not merge meshes; use --merge-all-meshes."
+        ),
+    )
+    parser.add_argument(
+        "--single-mesh",
+        dest="single_props_file",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--smooth-normals",
+        action="store_true",
+        help="Generate smooth normals for meshes imported through Assimp only.",
+    )
     parser.add_argument("--ignore-cameras", action="store_true", help="Do not export cameras.")
     parser.add_argument("--ignore-lights", action="store_true", help="Do not export lights.")
     parser.add_argument("--fbx-y-up", action="store_true", help="Convert imported FBX stage to Y-up.")
     parser.add_argument("--fbx-z-up", action="store_true", help="Convert imported FBX stage to Z-up.")
     parser.add_argument("--keep-all-materials", action="store_true", help="Keep materials not referenced by meshes.")
-    parser.add_argument("--merge-all-meshes", action="store_true", help="Merge meshes into one mesh.")
+    parser.add_argument(
+        "--merge-all-meshes",
+        action="store_true",
+        help="Merge eligible static, non-instanced meshes into one mesh.",
+    )
     parser.add_argument(
         "--double-precision-xform",
         action="store_true",
@@ -154,6 +184,20 @@ def _status_name(status: object) -> str:
     return getattr(status, "name", str(status))
 
 
+def _windows_trailing_space_or_dot_error(path: str) -> str | None:
+    """Reject Windows path components with trailing space/dot (can create undeletable dirs)."""
+    if os.name != "nt":
+        return None
+    for part in path.replace("/", "\\").split("\\"):
+        if not part or part in (".", ".."):
+            continue
+        if len(part) == 2 and part[1] == ":" and part[0].isalpha():
+            continue
+        if part != part.rstrip(" ."):
+            return f"Error: invalid output path component {part!r} (trailing space or period)"
+    return None
+
+
 def _request_interrupt() -> None:
     """Mark interrupt requested. Safe from console-ctrl / signal threads.
 
@@ -262,11 +306,17 @@ async def _convert(args: argparse.Namespace) -> int:
         faulthandler.enable()
         os.environ["OMNI_ASSET_CONVERTER_DEBUG"] = "1"
 
+    path_error = _windows_trailing_space_or_dot_error(args.output)
+    if path_error:
+        _safe_print(path_error, file=sys.stderr)
+        return 1
+
     _print_debug(args, "importing asset_converter_native_bindings")
     import asset_converter_native_bindings as assetconverter
 
     input_path = os.path.abspath(args.input)
-    output_path = os.path.abspath(args.output)
+    output_path = Path(os.path.abspath(args.output))
+    is_usdz_output = usdz.is_usdz_path(output_path)
     _print_debug(args, f"input path: {input_path}")
     _print_debug(args, f"output path: {output_path}")
 
@@ -282,9 +332,21 @@ async def _convert(args: argparse.Namespace) -> int:
         )
         return 1
 
-    output_dir = os.path.dirname(output_path)
+    preview_surface = bool(getattr(args, "preview_surface", False))
+    if is_usdz_output and not args.ignore_materials and not preview_surface and hasattr(args, "preview_surface"):
+        preview_surface = True
+        _safe_print(
+            "Note: USDZ packaging automatically enables USD Preview Surface materials.",
+            file=sys.stderr,
+        )
+
+    output_dir = str(output_path.parent) if output_path.parent.parts else ""
     if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except OSError as exc:
+            _safe_print(f"Error: cannot create output directory {output_dir}: {exc}", file=sys.stderr)
+            return 1
 
     assetconverter.OmniAssetConverter.set_log_callback(_print_log)
     _print_debug(args, "native log callback registered")
@@ -294,54 +356,72 @@ async def _convert(args: argparse.Namespace) -> int:
 
     _install_interrupt_handlers()
     watch_task: asyncio.Task[None] | None = None
+    staging_context = usdz.temporary_staging_directory(output_path) if is_usdz_output else nullcontext(None)
     try:
-        _print_debug(args, "creating native conversion future")
-        converter = assetconverter.OmniAssetConverter(
-            input_path,
-            output_path,
-            progress_callback=_print_progress if args.progress else None,
-            ignore_material=args.ignore_materials,
-            ignore_animation=args.ignore_animation,
-            single_mesh=args.single_mesh,
-            smooth_normals=args.smooth_normals,
-            ignore_cameras=args.ignore_cameras,
-            ignore_lights=args.ignore_lights,
-            convert_fbx_to_y_up=args.fbx_y_up,
-            convert_fbx_to_z_up=args.fbx_z_up,
-            keep_all_materials=args.keep_all_materials,
-            merge_all_meshes=args.merge_all_meshes,
-            use_double_precision_to_usd_transform_op=args.double_precision_xform,
-            ignore_pivots=args.ignore_pivots,
-            disable_instancing=args.disable_instancing,
-            export_hidden_props=args.export_hidden_props,
-            baking_scales=args.baking_scales,
-            ignore_flip_rotations=args.ignore_flip_rotations,
-            ignore_unbound_bones=args.ignore_unbound_bones,
-            export_embedded_gltf=args.export_embedded_gltf,
-            convert_stage_up_y=args.stage_up_y,
-            convert_stage_up_z=args.stage_up_z,
-        )
+        with staging_context as staging_dir:
+            layer_output_path = usdz.staging_layer_path(staging_dir, output_path) if is_usdz_output else output_path
+            _print_debug(args, f"layer output path: {layer_output_path}")
+            _print_debug(args, "creating native conversion future")
+            converter = assetconverter.OmniAssetConverter(
+                input_path,
+                str(layer_output_path),
+                progress_callback=_print_progress if args.progress else None,
+                ignore_material=args.ignore_materials,
+                ignore_animation=args.ignore_animation,
+                single_mesh=args.single_props_file,
+                smooth_normals=args.smooth_normals,
+                ignore_cameras=args.ignore_cameras,
+                ignore_lights=args.ignore_lights,
+                convert_fbx_to_y_up=args.fbx_y_up,
+                convert_fbx_to_z_up=args.fbx_z_up,
+                keep_all_materials=args.keep_all_materials,
+                merge_all_meshes=args.merge_all_meshes,
+                use_double_precision_to_usd_transform_op=args.double_precision_xform,
+                ignore_pivots=args.ignore_pivots,
+                disable_instancing=args.disable_instancing,
+                export_hidden_props=args.export_hidden_props,
+                baking_scales=args.baking_scales,
+                ignore_flip_rotations=args.ignore_flip_rotations,
+                ignore_unbound_bones=args.ignore_unbound_bones,
+                export_embedded_gltf=args.export_embedded_gltf,
+                convert_stage_up_y=args.stage_up_y,
+                convert_stage_up_z=args.stage_up_z,
+            )
 
-        watch_task = asyncio.create_task(_watch_for_interrupt(converter))
-        async with converter:
-            _print_debug(args, "native conversion future completed")
-            with _interrupt_lock:
-                interrupted = _interrupt_requested
-            status = converter.get_status()
+            watch_task = asyncio.create_task(_watch_for_interrupt(converter))
+            async with converter:
+                _print_debug(args, "native conversion future completed")
+                with _interrupt_lock:
+                    interrupted = _interrupt_requested
+                status = converter.get_status()
 
-            if interrupted or status == assetconverter.OmniConverterStatus.CANCELLED:
-                _safe_print("Interrupted.", file=sys.stderr, flush=True)
-                return _INTERRUPT_EXIT_CODE
+                if interrupted or status == assetconverter.OmniConverterStatus.CANCELLED:
+                    _safe_print("Interrupted.", file=sys.stderr, flush=True)
+                    return _INTERRUPT_EXIT_CODE
 
-            if status == assetconverter.OmniConverterStatus.OK:
+                if status != assetconverter.OmniConverterStatus.OK:
+                    _safe_print(f"Error: conversion failed with status {_status_name(status)}", file=sys.stderr)
+                    detailed_error = converter.get_detailed_error()
+                    if detailed_error:
+                        _safe_print(detailed_error, file=sys.stderr)
+                    return 1
+
+                if is_usdz_output:
+                    if not layer_output_path.is_file():
+                        _safe_print(
+                            f"Error: conversion succeeded but staging layer was not created: {layer_output_path}",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    try:
+                        _print_debug(args, f"packaging USDZ: {output_path}")
+                        usdz.package_usdz(layer_output_path, output_path)
+                    except usdz.UsdzError as exc:
+                        _safe_print(f"Error: {exc}", file=sys.stderr)
+                        return 1
+
                 _safe_print(f"Successfully converted: {output_path}")
                 return 0
-
-            _safe_print(f"Error: conversion failed with status {_status_name(status)}", file=sys.stderr)
-            detailed_error = converter.get_detailed_error()
-            if detailed_error:
-                _safe_print(detailed_error, file=sys.stderr)
-            return 1
     finally:
         if watch_task is not None:
             watch_task.cancel()
@@ -366,6 +446,16 @@ def main(argv: list[str] | None = None) -> int:
         _request_interrupt()
         _safe_print("Interrupted.", file=sys.stderr, flush=True)
         return _INTERRUPT_EXIT_CODE
+    except Exception as exc:
+        # Curated CLI error for unexpected failures (avoids raw traceback by default).
+        _safe_print(f"Error: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        if args.debug:
+            import traceback
+
+            traceback.print_exc(file=sys.stderr)
+        else:
+            _safe_print("Hint: rerun with --debug for a full traceback.", file=sys.stderr, flush=True)
+        return 1
 
 
 if __name__ == "__main__":

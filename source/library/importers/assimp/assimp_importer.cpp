@@ -1597,7 +1597,7 @@ std::vector<std::string> AssimpImporter::GetMaterialTexturePaths(aiMaterial* mat
     {
         aiString aiPath;
         material->GetTexture(type, i, &aiPath);
-        std::string filename(aiPath.C_Str());
+        std::string filename = PathUtils::NormalizeAssetPathSeparators(aiPath.C_Str());
         if (!filename.empty())
         {
             textures.push_back(filename);

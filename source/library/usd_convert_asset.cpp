@@ -139,8 +139,7 @@ static OmniConverterContext CreateConverterContext(
         }
 
 #if defined(_WIN32)
-        std::string filename = "\\\\?\\" + std::string(path);
-        std::replace(filename.begin(), filename.end(), '/', '\\');
+        std::wstring filename = L"\\\\?\\" + Unicode::convert(path);
 #else
         std::string filename = path;
 #endif

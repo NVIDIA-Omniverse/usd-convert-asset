@@ -39,6 +39,9 @@ public:
     // Checkes if path is absolute.
     static bool IsAbsolutePath(const std::string& path);
 
+    // Converts separators from imported asset metadata to portable separators.
+    static std::string NormalizeAssetPathSeparators(const std::string& path);
+
     static std::string NormalizePath(const std::string& path);
 
     // Checks if two paths are equal.

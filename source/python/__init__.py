@@ -38,20 +38,10 @@ _logger = logging.getLogger(__name__)
 # versions in one process can still corrupt shared Tf/Plug singletons. Run this
 # before preloading any USD-linked native library below. The bundled pxr can land
 # under either python-path layout, so pass both candidates.
-_check_pxr_conflict(
+_has_pxr_conflict = _check_pxr_conflict(
     os.path.join(_libs_dir, "python", "pxr"),
     os.path.join(_libs_dir, "lib", "python", "pxr"),
 )
-
-
-def _prepend_env_path(name, path):
-    if not os.path.isdir(path):
-        return
-
-    existing = os.environ.get(name)
-    paths = existing.split(os.pathsep) if existing else []
-    if path not in paths:
-        os.environ[name] = os.pathsep.join([path] + paths) if paths else path
 
 
 def _prepend_sys_path(path):
@@ -65,7 +55,10 @@ def _register_bundled_usd_plugins():
     except ImportError:
         return
 
-    resource_paths = [os.path.join(_libs_dir, "resources")]
+    resource_paths = [
+        os.path.join(_libs_dir, "resources"),
+        os.path.join(_libs_dir, "usd"),
+    ]
     resource_paths.extend(path for path in os.environ.get("PXR_PLUGINPATH_NAME", "").split(os.pathsep) if path)
 
     registered_paths = set()
@@ -98,8 +91,6 @@ def _preload_bundled_library(library_name):
         ctypes.CDLL(library_path, mode=ctypes.RTLD_GLOBAL)
 
 
-_prepend_env_path("PXR_PLUGINPATH_NAME", os.path.join(_libs_dir, "resources"))
-_prepend_env_path("PXR_PLUGINPATH_NAME", os.path.join(_libs_dir, "usd"))
 _prepend_sys_path(os.path.join(_libs_dir, "lib", "python"))
 _prepend_sys_path(os.path.join(_libs_dir, "python"))
 
@@ -123,8 +114,11 @@ elif sys.platform == "linux":
     # ctypes.CDLL(os.path.join(os.path.dirname(__file__), 'libs/libfbxsdk.so'))
     ctypes.CDLL(os.path.join(_libs_dir, "libusd_convert_asset.so"))
 
-_register_bundled_usd_plugins()
+if not _has_pxr_conflict:
+    _register_bundled_usd_plugins()
 
+# Import the native bindings after a conflict warning to keep the API available.
+# Skipping bundled plugin registration does not make mixed OpenUSD builds safe.
 from ._assetconverter import *
 
 __all__ = ["OmniAssetConverter"]

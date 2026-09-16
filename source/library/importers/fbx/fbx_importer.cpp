@@ -8,9 +8,13 @@
 #include "../../common/fbx_common.h"
 #include "../../utils/utils.h"
 
+#include <algorithm>
+#include <cmath>
 #include <experimental/filesystem>
 #include <fbxsdk.h>
+#include <functional>
 #include <numeric>
+#include <sstream>
 
 namespace fs = std::experimental::filesystem;
 
@@ -54,6 +58,27 @@ bool AllGfElementsAreEqual(const PXR_NS::VtQuatdArray& samples)
         }
     );
 }
+
+bool IsNondecreasing(const PXR_NS::VtArray<double>& values)
+{
+    return std::adjacent_find(values.begin(), values.end(), std::greater<double>()) == values.end();
+}
+
+int GetImplicitControlPointCount(fbxsdk::FbxNurbsCurve::EType type, int order)
+{
+    switch (type)
+    {
+        case fbxsdk::FbxNurbsCurve::eOpen:
+            return 0;
+        case fbxsdk::FbxNurbsCurve::eClosed:
+            return 1;
+        case fbxsdk::FbxNurbsCurve::ePeriodic:
+            return order - 1;
+        default:
+            return -1;
+    }
+}
+
 } // namespace
 
 static PXR_NS::GfMatrix4d FbxAMatrixToGfMatrix(const fbxsdk::FbxAMatrix& matrix)
@@ -180,6 +205,10 @@ StagePtr FbxSdkImporter::ImportStage(const OmniFutureThreadContextPtr& context, 
 {
     mThreadContext = context;
     status = OmniConverterStatus::OK;
+    mFbxNurbsCurveToCurveIndex.clear();
+    mFailedNurbsCurves.clear();
+    mImportedNurbsCurveCount = 0;
+    mDroppedNurbsCurveCount = 0;
     Log("Starting to import asset with FBX importer.");
 
     std::lock_guard<std::mutex> lock(gFbxManagerLock);
@@ -285,6 +314,7 @@ StagePtr FbxSdkImporter::ImportStage(const OmniFutureThreadContextPtr& context, 
             PopulateStageTree(importScene.get(), rootNode, stage, nullptr, nullptr, false, unitsScale);
             PopulateAllMeshes(importScene.get(), stage, unitsScale, meshConverter);
             BakingScales(stage);
+            LogNurbsCurveSummary();
         }
     }
 
@@ -300,6 +330,31 @@ StagePtr FbxSdkImporter::ImportStage(const OmniFutureThreadContextPtr& context, 
 void FbxSdkImporter::Log(const std::string& message)
 {
     mThreadContext->converterContext.Log(message.c_str());
+}
+
+void FbxSdkImporter::LogNurbsCurveSummary()
+{
+    if (mImportedNurbsCurveCount == 0 && mDroppedNurbsCurveCount == 0)
+    {
+        return;
+    }
+
+    std::ostringstream message;
+    message << "FBX NURBS curves: " << mImportedNurbsCurveCount << " authored as UsdGeomNurbsCurves";
+    if (mDroppedNurbsCurveCount > 0)
+    {
+        message << ", " << mDroppedNurbsCurveCount << " skipped because source data was invalid for UsdGeomNurbsCurves";
+    }
+    message << ".";
+
+    if (mDroppedNurbsCurveCount > 0)
+    {
+        Log("[WARNING] " + message.str());
+    }
+    else
+    {
+        Log(message.str());
+    }
 }
 
 void FbxSdkImporter::PopulateStageInfo(fbxsdk::FbxImporter* importer, fbxsdk::FbxScene* scene, const StagePtr& stage, double& unitsScale)
@@ -592,6 +647,43 @@ void FbxSdkImporter::PopulateStageTree(
 
                 break;
             }
+            case fbxsdk::FbxNodeAttribute::eNurbsCurve:
+            {
+                if (!mThreadContext->converterContext.IsOutputAssetUsdcOrUsdaOrUsdz())
+                {
+                    break;
+                }
+
+                fbxsdk::FbxNurbsCurve* fbxCurve = currentNode->GetNurbsCurve();
+                if (!fbxCurve)
+                {
+                    break;
+                }
+
+                if (mFailedNurbsCurves.count(fbxCurve) > 0)
+                {
+                    break;
+                }
+
+                auto curveIter = mFbxNurbsCurveToCurveIndex.find(fbxCurve);
+                if (curveIter == mFbxNurbsCurveToCurveIndex.end())
+                {
+                    CurvePtr curve = PopulateNurbsCurve(currentNode, fbxCurve, scale);
+                    if (!curve)
+                    {
+                        mFailedNurbsCurves.insert(fbxCurve);
+                        break;
+                    }
+
+                    const size_t curveIndex = stage->curves.size();
+                    stage->curves.push_back(curve);
+                    curveIter = mFbxNurbsCurveToCurveIndex.insert({ fbxCurve, curveIndex }).first;
+                    mImportedNurbsCurveCount += 1;
+                }
+
+                stageNode->curveInstances.push_back(curveIter->second);
+                break;
+            }
             case fbxsdk::FbxNodeAttribute::eCamera:
                 if (!mThreadContext->converterContext.IgnoreCameras())
                 {
@@ -679,6 +771,119 @@ void FbxSdkImporter::PopulateStageTree(
     {
         *currentSkeletonRoot = nullptr;
     }
+}
+
+CurvePtr FbxSdkImporter::PopulateNurbsCurve(fbxsdk::FbxNode* currentNode, fbxsdk::FbxNurbsCurve* fbxCurve, double scale)
+{
+    const char* curveName = fbxCurve->GetName();
+    if (!curveName || curveName[0] == '\0')
+    {
+        curveName = currentNode ? currentNode->GetName() : nullptr;
+    }
+    const std::string elementName = curveName && curveName[0] != '\0' ? curveName : "NurbsCurve";
+
+    auto skipInvalidCurve = [this, &elementName](const char* reason) -> CurvePtr
+    {
+        mDroppedNurbsCurveCount += 1;
+        Log("[WARNING] Skipping invalid FBX NURBS curve '" + elementName + "': " + reason +
+            ". No UsdGeomNurbsCurves or UsdGeomBasisCurves prim was authored.");
+        return nullptr;
+    };
+
+    const int sourcePointCount = fbxCurve->GetControlPointsCount();
+    const int order = fbxCurve->GetOrder();
+    if (sourcePointCount <= 0 || order <= 0)
+    {
+        return skipInvalidCurve("order or control-point count is invalid");
+    }
+
+    CurvePtr curve = std::make_shared<Curve>();
+    curve->name = elementName;
+
+    PXR_NS::VtArray<PXR_NS::GfVec3f> sourcePoints;
+    PXR_NS::VtArray<double> sourceWeights;
+    sourcePoints.reserve(sourcePointCount);
+    sourceWeights.reserve(sourcePointCount);
+    bool hasNonUnitWeights = false;
+    const fbxsdk::FbxVector4* fbxControlPoints = fbxCurve->GetControlPoints();
+    if (!fbxControlPoints)
+    {
+        return skipInvalidCurve("control points are missing");
+    }
+
+    for (int i = 0; i < sourcePointCount; ++i)
+    {
+        const fbxsdk::FbxVector4& point = fbxControlPoints[i];
+        const PXR_NS::GfVec3f sourcePoint(
+            static_cast<float>(point[0] * scale),
+            static_cast<float>(point[1] * scale),
+            static_cast<float>(point[2] * scale)
+        );
+        const double weight = point[3] == 0.0 ? 1.0 : point[3];
+        if (!std::isfinite(sourcePoint[0]) || !std::isfinite(sourcePoint[1]) || !std::isfinite(sourcePoint[2]) || !std::isfinite(weight))
+        {
+            return skipInvalidCurve("control points or weights contain non-finite values");
+        }
+        sourcePoints.push_back(sourcePoint);
+        sourceWeights.push_back(weight);
+        hasNonUnitWeights = hasNonUnitWeights || !PXR_NS::GfIsClose(weight, 1.0, 1e-8);
+    }
+
+    const int knotCount = fbxCurve->GetKnotCount();
+    const double* fbxKnots = fbxCurve->GetKnotVector();
+    if (knotCount <= 0 || !fbxKnots)
+    {
+        return skipInvalidCurve("knot vector is missing");
+    }
+    PXR_NS::VtArray<double> knots;
+    knots.assign(fbxKnots, fbxKnots + knotCount);
+
+    // FBX and OpenUSD both retain the two outer knots. FBX omits repeated
+    // control points for closed and periodic forms, while OpenUSD requires
+    // them explicitly. Expanding those implicit points makes the unmodified
+    // FBX knot vector satisfy USD's points + order knot-count requirement.
+    const int implicitPointCount = GetImplicitControlPointCount(fbxCurve->GetType(), order);
+    const int usdPointCount = sourcePointCount + std::max(implicitPointCount, 0);
+    if (implicitPointCount < 0 || implicitPointCount > sourcePointCount || order > usdPointCount || knotCount != usdPointCount + order ||
+        std::any_of(
+            knots.begin(),
+            knots.end(),
+            [](double knot)
+            {
+                return !std::isfinite(knot);
+            }
+        ) ||
+        !IsNondecreasing(knots))
+    {
+        return skipInvalidCurve("knot vector or form does not map cleanly to UsdGeomNurbsCurves");
+    }
+
+    PXR_NS::VtArray<PXR_NS::GfVec3f> usdPoints = sourcePoints;
+    PXR_NS::VtArray<double> usdWeights = sourceWeights;
+    for (int i = 0; i < implicitPointCount; ++i)
+    {
+        usdPoints.push_back(sourcePoints[i]);
+        usdWeights.push_back(sourceWeights[i]);
+    }
+
+    const double rangeMin = knots[order - 1];
+    const double rangeMax = knots[usdPointCount];
+    if (rangeMin >= rangeMax)
+    {
+        return skipInvalidCurve("NURBS parameter range is invalid");
+    }
+
+    curve->schema = CurveSchema::Nurbs;
+    curve->vertexCounts.push_back(usdPointCount);
+    curve->points = std::move(usdPoints);
+    curve->orders.push_back(order);
+    curve->knots = std::move(knots);
+    curve->ranges.push_back(PXR_NS::GfVec2d(rangeMin, rangeMax));
+    if (fbxCurve->IsRational() || hasNonUnitWeights)
+    {
+        curve->pointWeights = std::move(usdWeights);
+    }
+    return curve;
 }
 
 void FbxSdkImporter::PopulateAllMeshes(fbxsdk::FbxScene* scene, const StagePtr& stage, double scale, fbxsdk::FbxGeometryConverter& converter)
@@ -1849,7 +2054,7 @@ TextureReference FbxSdkImporter::LoadTexture(const StagePtr& stage, fbxsdk::FbxP
         fbxsdk::FbxFileTexture* fbxFileTexture = textureProperty.GetSrcObject<fbxsdk::FbxFileTexture>(i);
         if (fbxFileTexture)
         {
-            std::string filePath = fbxFileTexture->GetFileName();
+            std::string filePath = PathUtils::NormalizeAssetPathSeparators(fbxFileTexture->GetFileName());
             if (filePath.empty())
             {
                 // It's possible that this texture links to another one.
@@ -1861,7 +2066,7 @@ TextureReference FbxSdkImporter::LoadTexture(const StagePtr& stage, fbxsdk::FbxP
                         fbxsdk::FbxFileTexture* propertyFileTexture = p.GetSrcObject<fbxsdk::FbxFileTexture>(j);
                         if (propertyFileTexture)
                         {
-                            filePath = propertyFileTexture->GetFileName();
+                            filePath = PathUtils::NormalizeAssetPathSeparators(propertyFileTexture->GetFileName());
                             if (!filePath.empty())
                             {
                                 break;

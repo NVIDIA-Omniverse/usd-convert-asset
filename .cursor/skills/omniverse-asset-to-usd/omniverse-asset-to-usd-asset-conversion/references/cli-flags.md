@@ -20,14 +20,13 @@ usd-convert-asset -i scene.fbx -o scene.usda --ignore-materials --ignore-animati
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-i` / `--input` | required | Input asset file path. |
-| `-o` / `--output` | required | Output USD file path: `.usd`, `.usda`, or `.usdc`. |
+| `-o` / `--output` | required | Output USD file path: `.usd`, `.usda`, `.usdc`, or `.usdz`. |
 | `--ignore-materials` | false | Do not export materials. |
 | `--ignore-animation` | false | Do not export animation. |
-| `--single-mesh` | false | Export a single mesh USD file. |
-| `--smooth-normals` | false | Generate smooth normals for meshes. |
+| `--single-props-file` | false | Write repeated mesh prototypes to one props USD file instead of separate mesh USD files. Does not merge meshes. |
+| `--smooth-normals` | false | Generate smooth normals for meshes imported through Assimp only. Has no effect on native OBJ, glTF/GLB, USD, or FBX importers. |
 | `--ignore-cameras` | false | Do not export cameras. |
 | `--ignore-lights` | false | Do not export lights. |
-| `--preview-surface` | false | Export USD Preview Surface materials. Flavor-sensitive `AUTOREMOVE` option. |
 | `--fbx-y-up` | false | Convert imported FBX stage to Y-up. |
 | `--fbx-z-up` | false | Convert imported FBX stage to Z-up. |
 | `--keep-all-materials` | false | Keep materials not referenced by meshes. |
@@ -45,3 +44,7 @@ usd-convert-asset -i scene.fbx -o scene.usda --ignore-materials --ignore-animati
 | `--stage-up-z` | false | Override output stage up-axis to Z. Mutually exclusive with `--stage-up-y`. |
 | `--progress` | false | Print conversion progress to stderr. |
 | `--debug` | false | Print detailed CLI/native logs, enable `faulthandler`, and set `OMNI_ASSET_CONVERTER_DEBUG=1`. |
+
+Linux aarch64 imports FBX through Assimp because Autodesk FBX SDK is unavailable
+for that target. FBX SDK-specific options apply only on Windows x86_64 and Linux
+x86_64.

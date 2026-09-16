@@ -44,6 +44,10 @@ Linux aarch64:
 ./repo.sh uv -- build _build/linux-aarch64/release/pip/usd_convert_asset -o dist
 ```
 
+The Linux aarch64 wheel converts FBX through Assimp. Windows x86_64 and Linux
+x86_64 use Autodesk FBX SDK and additionally support FBX NURBS curve
+preservation.
+
 The wheel is written to `dist/`:
 
 ```text
@@ -80,8 +84,12 @@ source .venv/bin/activate
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install dist/usd_convert_asset-<version>-<python>-<abi>-<platform>.whl
 usd-convert-asset -i path/to/input.fbx -o path/to/output.usda
+usd-convert-asset -i path/to/input.fbx -o path/to/output.usdz
 .venv/bin/python -m usd_convert_asset -i path/to/input.obj -o path/to/output.usdc
 ```
+
+USDZ output enables USD Preview Surface automatically when materials are exported.
+Use `--ignore-materials` to create a geometry-only USDZ package.
 
 To test the staged tree before building a wheel, replace the wheel install with
 the generated pip package directory:
@@ -93,7 +101,7 @@ the generated pip package directory:
 Use the matching `_build/<platform>/<config>/pip/usd_convert_asset` path
 for the platform and configuration you built. Replace the input paths with
 existing source assets and the output paths with writable locations. Run
-`usd-convert-asset --help` for conversion flags such as `--single-mesh`,
+`usd-convert-asset --help` for conversion flags such as `--single-props-file`,
 `--ignore-materials`, `--fbx-y-up`, and `--progress`.
 
 ## License

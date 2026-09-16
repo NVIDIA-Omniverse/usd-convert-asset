@@ -1,10 +1,20 @@
 # Contributing
 
-Thank you for your interest in contributing to `usd-convert-asset`.
+Thank you for your interest in `usd-convert-asset`.
 
-This project accepts contributions through pull requests. Before opening a pull
-request, please make sure your change is focused, documented where appropriate,
-and tested for the behavior it affects.
+This repository contains the native C++ conversion libraries, Python bindings,
+USD plugin resources, and documentation for `usd-convert-asset`.
+
+## Contribution Policy
+
+This project is not currently accepting external contributions or pull requests.
+Unsolicited pull requests will be closed. Because external contributions are not
+accepted, no Contributor License Agreement (CLA) or Developer Certificate of
+Origin (DCO) process applies.
+
+NVIDIA maintainers may continue to update this repository through NVIDIA's
+internal development and review processes. A future change to the external
+contribution policy will be documented in this file and in `README.md`.
 
 ## Reporting Issues
 
@@ -20,23 +30,6 @@ Include enough detail for maintainers to reproduce or understand the issue:
 
 Do not report security vulnerabilities through public issues. See `SECURITY.md`
 for private disclosure instructions.
-
-## Pull Requests
-
-Pull requests should be scoped to a single logical change. Include a clear
-description of the problem being solved and the approach taken.
-
-Before submitting a pull request:
-
-- Run the repo build when your change affects native code, bindings, packaging,
-  or staged runtime files.
-- Run relevant tests or smoke tests.
-- Update `README.md`, `source/python/README.md`, or other docs when behavior,
-  options, packaging, or supported formats change.
-- Keep public APIs backwards compatible unless the pull request intentionally
-  proposes a breaking change.
-- Do not commit machine-specific dependency paths, build output, or local
-  virtual environments.
 
 ## Development Setup
 
@@ -65,7 +58,7 @@ Linux x86_64), then edit `deps/target-deps.packman.xml` locally and point the
 `fbxsdk` dependency at that staged folder. Do not commit local SDK paths.
 
 Linux aarch64 source builds do not use Autodesk FBX SDK because Autodesk does
-not support that target; FBX conversion uses Assimp instead.
+not support that target. FBX conversion uses Assimp on Linux aarch64.
 
 ## Building the Python Package
 
@@ -130,60 +123,6 @@ python -m pip install _build/<platform>/<config>/pip/usd_convert_asset
 Use small source-control-friendly sample assets when adding or changing
 conversion behavior.
 
-## Signing Your Work
-
-We require that all contributors sign off on their commits using the Developer
-Certificate of Origin (DCO). This certifies that the contribution is your
-original work, or that you have the right to submit it under this project's
-license or a compatible license.
-
-Contributions containing commits that are not signed off may not be accepted.
-To sign off on a commit, use the `--signoff` or `-s` option:
-
-```bash
-git commit -s -m "Add conversion option"
-```
-
-This appends a line like this to your commit message:
-
-```text
-Signed-off-by: Your Name <your.email@example.com>
-```
-
-Full text of the DCO:
-
-```text
-Developer Certificate of Origin
-Version 1.1
-
-Copyright (C) 2004, 2006 The Linux Foundation and its contributors.
-
-Everyone is permitted to copy and distribute verbatim copies of this license
-document, but changing it is not allowed.
-
-Developer's Certificate of Origin 1.1
-
-By making a contribution to this project, I certify that:
-
-(a) The contribution was created in whole or in part by me and I have the right
-to submit it under the open source license indicated in the file; or
-
-(b) The contribution is based upon previous work that, to the best of my
-knowledge, is covered under an appropriate open source license and I have the
-right under that license to submit that work with modifications, whether created
-in whole or in part by me, under the same open source license (unless I am
-permitted to submit under a different license), as indicated in the file; or
-
-(c) The contribution was provided directly to me by some other person who
-certified (a), (b) or (c) and I have not modified it.
-
-(d) I understand and agree that this project and the contribution are public and
-that a record of the contribution (including all personal information I submit
-with it, including my sign-off) is maintained indefinitely and may be
-redistributed consistent with this project or the open source license(s)
-involved.
-```
-
 ## Coding Guidelines
 
 - Follow the existing code style in the files you edit.
@@ -196,6 +135,5 @@ involved.
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the
-Apache License, Version 2.0 and the Creative Commons Attribution 4.0
-International Public License. See `LICENSE` for details.
+This project is licensed under the Apache License, Version 2.0 and the Creative
+Commons Attribution 4.0 International Public License. See `LICENSE` for details.

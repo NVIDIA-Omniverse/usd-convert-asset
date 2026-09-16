@@ -914,7 +914,8 @@ MeshPtr UsdSdkImporter::PopulateMesh(const StagePtr& stage, const PXR_NS::UsdGeo
         mesh->timeSampleStart = std::max(stage->startTime, timeSamples.front());
         mesh->timeSampleEnd = std::min(stage->endTime, timeSamples.back());
 
-        for (double time = timeSamples.front(); time <= timeSamples.back(); time += 1.0)
+        // Keep point and normal cache indices aligned to the same clamped time range.
+        for (double time = mesh->timeSampleStart; time <= mesh->timeSampleEnd; time += 1.0)
         {
             const auto& framePoints = GetUSDValue<PXR_NS::VtArray<PXR_NS::GfVec3f>>(pointsAttr, PXR_NS::UsdTimeCode(time));
             mesh->pointCacheTimesamples.push_back(framePoints);
@@ -936,6 +937,7 @@ MeshPtr UsdSdkImporter::PopulateMesh(const StagePtr& stage, const PXR_NS::UsdGeo
     PXR_NS::VtArray<int> faceVertexIndices = GetDefaultOrFirstTimeSampledValue<PXR_NS::VtArray<int>>(usdMesh.GetFaceVertexIndicesAttr());
     // Validate data completeness to discard those faces that are invalid.
     size_t index = 0;
+    size_t invalidFaceCount = 0;
 
     // reverse the face vertex indice's order to flip the normals when orientation is left handed
     auto orientation = usdMesh.GetOrientationAttr();
@@ -958,7 +960,7 @@ MeshPtr UsdSdkImporter::PopulateMesh(const StagePtr& stage, const PXR_NS::UsdGeo
 
         for (int j = 0; j < count; j++)
         {
-            if (faceVertexIndices[index + j] > mesh->points.size())
+            if (faceVertexIndices[index + j] < 0 || static_cast<size_t>(faceVertexIndices[index + j]) >= mesh->points.size())
             {
                 validFace = false;
                 break;
@@ -983,8 +985,19 @@ MeshPtr UsdSdkImporter::PopulateMesh(const StagePtr& stage, const PXR_NS::UsdGeo
                 );
             }
         }
+        else
+        {
+            invalidFaceCount++;
+        }
 
         index += count;
+    }
+    if (invalidFaceCount > 0)
+    {
+        mThreadContext->converterContext.Log(
+            "WARNING: Skipped " + std::to_string(invalidFaceCount) + " invalid " + (invalidFaceCount == 1 ? "face" : "faces") + " from mesh " +
+            usdMesh.GetPath().GetString() + "."
+        );
     }
 
     // Iterates to get the count of uv set

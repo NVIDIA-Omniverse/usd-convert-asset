@@ -2,14 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0 AND CC-BY-4.0
 #
 import os
+import platform
 import unittest
 
 import asset_converter_native_bindings as assetconverter
-import omni.asset_validator
 import omni.repo.man
+import usd_validation_nvidia
 from pxr import Ar
 
 __all__ = ["convert", "assetconverter", "AsyncTestCase"]
+
+IS_LINUX_AARCH64 = platform.system() == "Linux" and platform.machine().lower() in ("aarch64", "arm64")
 
 
 async def convert(input_path, output_path, material_loader):
@@ -59,35 +62,20 @@ class AsyncTestCase(unittest.IsolatedAsyncioTestCase):
             assetconverter.OmniAssetConverter.set_cache_folder("")
             assetconverter.OmniAssetConverter.set_log_callback(None)
 
-    def assertIsValidUsd(self, identifier):
-        validation_engine = omni.asset_validator.ValidationEngine()
-        # deregister MaterialPathChecker and MissingReferenceChecker to ignore issues when resolving OmPBR.mdl
-        validation_engine.disable_rule(omni.asset_validator.MaterialPathChecker)
-        validation_engine.disable_rule(omni.asset_validator.MissingReferenceChecker)
-        validation_engine.disable_rule(omni.asset_validator.MaterialUsdPreviewSurfaceChecker)
+    def assertIsValidUsd(self, identifier, validate_geometry=True):
+        # skip asset validation on linux-aarch64 for now as those runners take much longer to run
+        if IS_LINUX_AARCH64:
+            return
+
+        validation_engine = usd_validation_nvidia.ValidationEngine()
 
         # likely will be addressed in scene optimizer
-        validation_engine.disable_rule(omni.asset_validator.ManifoldChecker)
-        validation_engine.disable_rule(omni.asset_validator.IndexedPrimvarChecker)
-        validation_engine.disable_rule(omni.asset_validator.ZeroAreaFaceChecker)
-        validation_engine.disable_rule(omni.asset_validator.WeldChecker)
-        validation_engine.disable_rule(omni.asset_validator.UsdAsciiPerformanceChecker)
+        validation_engine.disable_rule(usd_validation_nvidia.ManifoldChecker)
+        validation_engine.disable_rule(usd_validation_nvidia.WeldChecker)
 
-        # to investigate..failing for assimp robust tests
-        validation_engine.disable_rule(omni.asset_validator.UnusedPrimvarChecker)
-        validation_engine.disable_rule(omni.asset_validator.TypeChecker)
-        validation_engine.disable_rule(omni.asset_validator.ExtentsChecker)
-        validation_engine.disable_rule(omni.asset_validator.SubdivisionSchemeChecker)
-        validation_engine.disable_rule(omni.asset_validator.ValidateTopologyChecker)
-        validation_engine.disable_rule(omni.asset_validator.UnusedMeshTopologyChecker)
-
-        # to investigate..failing for gltf robust tests
-        validation_engine.disable_rule(omni.asset_validator.TextureChecker)
-
-        # to investigate from upgrading to asset validator 1.9.2. Some importers may not be generating normals.
-        validation_engine.disable_rule(omni.asset_validator.NormalsValidChecker)
-        validation_engine.disable_rule(omni.asset_validator.NormalsExistChecker)
-        validation_engine.disable_rule(omni.asset_validator.NormalsWindingsChecker)
+        if not validate_geometry:
+            validation_engine.disable_rule(usd_validation_nvidia.ExtentsChecker)
+            validation_engine.disable_rule(usd_validation_nvidia.NormalsWindingsChecker)
 
         result = validation_engine.validate(identifier)
         self.assertEqual(result.asset, identifier)

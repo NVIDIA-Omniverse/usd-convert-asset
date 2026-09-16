@@ -18,6 +18,10 @@ tools: [Read, Shell]
 
 Install and verify `usd-convert-asset` in the intended Python environment, using the published wheel by default and the source-build fallback only when necessary.
 
+## Tested Wheel Version
+
+This skill was tested against `usd-convert-asset==1.1.0` using the Python 3.12 wheel.
+
 ## When to Use
 
 Use this module when the task asks to install, verify, build, or troubleshoot the `usd-convert-asset` package before running conversions. Stop applying once the package is installed in the intended Python environment and the smoke tests pass.
@@ -35,7 +39,7 @@ For actual conversions, CLI flag selection, format validation, or conversion tro
 
 ## Prerequisites
 
-- Python: `>=3.10,<3.13`
+- Python: `>=3.12,<3.13`
 - Distribution name: `usd-convert-asset`
 - Import package: `usd_convert_asset`
 - Console script: `usd-convert-asset`
@@ -90,6 +94,7 @@ After the package is installed and the smoke test passes, move to `../omniverse-
 - This module stops at installation, source-build fallback, and smoke-test verification.
 - It does not choose conversion flags or troubleshoot converted USD output; use the asset-conversion module for that work.
 - Autodesk FBX SDK setup requires the user to download the SDK and accept Autodesk license terms themselves.
+- The Linux aarch64 wheel converts FBX through Assimp rather than Autodesk FBX SDK.
 
 ## Troubleshooting
 

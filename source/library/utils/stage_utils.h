@@ -13,6 +13,12 @@ class StageUtils
 {
 public:
 
+    // Cleans all meshes after import and optional mesh merging.
+    static bool CleanupMeshes(const StagePtr& stage, std::string& detailedError);
+
+    // Removes points that no face references and remaps point-domain mesh data.
+    static bool CompactMeshPoints(const StagePtr& stage, const MeshPtr& mesh);
+
     // Optimize mesh to merge same points.
     static void OptimizeMeshes(const StagePtr& stage);
 

@@ -1420,11 +1420,6 @@ void GltfImporter::PopulateAllMeshes(StagePtr& stage, tinygltf::Model& model, do
                     }
                 );
 
-                if (uvs.empty())
-                {
-                    // Fill uv with (0, 0) if it has no uv set for this subset to make sure all faces will have uvs.
-                    uvs = PXR_NS::VtVec2fArray(numExistingIndices, PXR_NS::GfVec2f(0.5f, 0.5f));
-                }
                 std::copy(uvs.begin(), uvs.end(), std::back_inserter<decltype(uvs)>(stageMesh->uvs[uvIndex]));
             }
 

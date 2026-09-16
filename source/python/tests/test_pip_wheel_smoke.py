@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import skipUnless
 
@@ -97,6 +98,7 @@ class TestPipWheelSmoke(unittest.TestCase):
         self.assertIn("Convert 3D assets to USD", result.stdout)
         self.assertIn("--input", result.stdout)
         self.assertIn("--output", result.stdout)
+        self.assertIn(".usdz", result.stdout)
 
     def test_cli_converts_cube_fbx_to_usd(self):
         if not _CUBE_FBX_PATH.is_file():
@@ -109,6 +111,32 @@ class TestPipWheelSmoke(unittest.TestCase):
             self.assertNotIn("ModuleNotFoundError: No module named 'pxr'", result.stderr)
             self.assertTrue(output_path.is_file())
             self.assertGreater(output_path.stat().st_size, 0)
+
+    def test_cli_converts_cube_fbx_to_usdz(self):
+        if not _CUBE_FBX_PATH.is_file():
+            self.skipTest(f"missing test fixture: {_CUBE_FBX_PATH}")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "cube.usdz"
+            result = self._run_cli("-i", str(_CUBE_FBX_PATH), "-o", str(output_path))
+            self.assertEqual(result.returncode, 0, msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
+            self.assertTrue(output_path.is_file())
+            self.assertGreater(output_path.stat().st_size, 0)
+            self.assertFalse(list(output_path.parent.glob(".cube.usdz.staging-*")))
+            self.assertEqual(output_path.read_bytes()[:2], b"PK")
+            with zipfile.ZipFile(output_path) as archive:
+                self.assertIn(f"{output_path.stem}.usdc", archive.namelist())
+
+    def test_cli_rejects_unknown_output_extension(self):
+        if not _CUBE_FBX_PATH.is_file():
+            self.skipTest(f"missing test fixture: {_CUBE_FBX_PATH}")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "cube.obj"
+            result = self._run_cli("-i", str(_CUBE_FBX_PATH), "-o", str(output_path))
+
+        self.assertNotEqual(result.returncode, 0, msg=result.stdout)
+        self.assertIn("unsupported output format '.obj'", result.stderr)
 
 
 if __name__ == "__main__":

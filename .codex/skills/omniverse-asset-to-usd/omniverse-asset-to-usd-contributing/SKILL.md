@@ -1,6 +1,6 @@
 ---
 name: omniverse-asset-to-usd-contributing
-description: Use when a user asks to modify, test, document, package, or review code changes for the usd-convert-asset repository, CLI, Python package, wheel staging, or smoke tests.
+description: Use when an NVIDIA maintainer asks to modify, test, document, package, or review code changes for the usd-convert-asset repository, CLI, Python package, wheel staging, or smoke tests. External contributions and pull requests are not accepted.
 version: "0.1.0"
 license: Apache-2.0 AND CC-BY-4.0
 metadata:
@@ -9,18 +9,30 @@ metadata:
 tools: [Read, Edit, Shell]
 ---
 
-# Contributing - Omniverse Asset to USD
+# Maintainer Development - Omniverse Asset to USD
 
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
 <!-- SPDX-License-Identifier: Apache-2.0 AND CC-BY-4.0 -->
 
 ## Purpose
 
-Guide code, packaging, documentation, and test changes for the `usd-convert-asset` repository without mixing contributor workflow into the end-user conversion skill.
+Guide NVIDIA maintainer code, packaging, documentation, and test changes for the
+`usd-convert-asset` repository without mixing maintainer workflows into the
+end-user conversion skill.
+
+## Tested Wheel Version
+
+This skill was tested against `usd-convert-asset==1.1.0` using the Python 3.12 wheel.
+
+This repository does not accept external contributions or pull requests. Do not
+present this module as an external contribution workflow. See the repository
+`CONTRIBUTING.md` for the full contribution policy and issue-reporting guidance.
 
 ## When to Use
 
-Use this module when a user asks to change converter implementation, CLI arguments, package metadata, wheel staging, smoke tests, build docs, release notes, or repository contribution workflow.
+Use this module when an NVIDIA maintainer asks to change converter
+implementation, CLI arguments, package metadata, wheel staging, smoke tests,
+build docs, release notes, or maintainer workflow.
 
 For installing or building the package, load `../omniverse-asset-to-usd-getting-started/SKILL.md`. For running conversions or choosing CLI flags, load `../omniverse-asset-to-usd-asset-conversion/SKILL.md`.
 
@@ -31,6 +43,7 @@ Before editing, identify the change type and read the local implementation:
 | Change type | Read first |
 |-------------|------------|
 | CLI behavior | `source/python/usd_convert_asset/cli.py` |
+| USDZ helper | `source/python/usd_convert_asset/usdz.py` |
 | Module entry point | `source/python/usd_convert_asset/__main__.py` |
 | Package metadata | `source/python/templates/pyproject.toml` |
 | Wheel staging | `source/python/premake5.lua` and `source/python/hatch_build.py` |
@@ -56,7 +69,7 @@ Use the smallest verification that covers the changed surface:
 | `python -m usd_convert_asset` entry point | `python -m usd_convert_asset --help` |
 | Wheel metadata or native runtime staging | Build a wheel from the staged `_build/<platform>/<config>/pip/usd_convert_asset` tree, install it into a clean venv, then import `usd_convert_asset` and `asset_converter_native_bindings` |
 | Smoke test changes | `python -m unittest discover -s source/python/tests -p "test_pip_wheel_smoke.py" -v` after installing the wheel |
-| Build or contribution docs | Check changed commands against `README.md`, `source/python/README.md`, and `CONTRIBUTING.md` |
+| Build or maintainer docs | Check changed commands against `README.md`, `source/python/README.md`, and `CONTRIBUTING.md` |
 
 ## Output
 

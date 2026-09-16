@@ -4,6 +4,7 @@
 #include "path_utils.h"
 
 #include "../pxr_includes.h"
+#include "string_utils.h"
 #include "unicode.h"
 
 #include <usd_convert_asset.h>
@@ -463,6 +464,15 @@ bool PathUtils::IsAbsolutePath(const std::string& path)
     }
 
     return false;
+}
+
+std::string PathUtils::NormalizeAssetPathSeparators(const std::string& path)
+{
+    std::string normalizedPath = path;
+    // Replace separator pairs first so each pair produces one forward slash.
+    StringUtils::ReplaceAll(normalizedPath, "\\\\", "/");
+    StringUtils::ReplaceAll(normalizedPath, "\\", "/");
+    return normalizedPath;
 }
 
 std::string PathUtils::NormalizePath(const std::string& path)

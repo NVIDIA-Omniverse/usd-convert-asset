@@ -60,6 +60,23 @@ fetch.after_pull_commands = [
     ],
 ]
 
+# Include dist/ so -x/--rebuild and -f/--fast-rebuild wipe stale wheels.
+# Folders lists replace repo_build defaults; keep the stock entries and add dist.
+[repo_build.clean]
+folders = [
+    "${root}/_build",
+    "${root}/_compiler",
+    "${root}/_builtpackages",
+    "${root}/dist",
+]
+
+[repo_build.partial_clean]
+folders = [
+    "${root}/_build/$platform/$config",
+    "${root}/_build/generated",
+    "${root}/dist",
+]
+
 ########################################################################################################################
 # CI Entry points (scripts)
 ########################################################################################################################

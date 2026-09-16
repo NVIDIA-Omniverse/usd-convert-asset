@@ -6,7 +6,7 @@ bindings, and USD plugin resources for converting source assets to USD.
 ## Overview
 
 usd-convert-asset provides native and Python entry points for converting
-3D asset files into USD, USDA, or USDC outputs. It is intended for tools
+3D asset files into USD, USDA, USDC, or USDZ outputs. It is intended for tools
 and pipelines that need scriptable asset ingestion into OpenUSD-based workflows.
 
 Key repository areas:
@@ -55,6 +55,8 @@ Replace `<platform>` with the build platform:
 - Linux x86_64: `linux-x86_64`
 - Linux aarch64: `linux-aarch64`
 
+The Linux aarch64 build converts FBX through Assimp rather than Autodesk FBX SDK.
+
 More Python package details live in `source/python/README.md`.
 
 ### OpenUSD Runtime Compatibility
@@ -101,7 +103,7 @@ with a local source path to the staged folder:
 - Linux x86_64: `include` and `lib/release`
 
 For Linux aarch64, do not download or configure FBX SDK. Autodesk FBX SDK does
-not support this target, so FBX conversion uses Assimp instead.
+not support this target. FBX conversion uses Assimp on Linux aarch64.
 
 Treat this as a local-only dependency override. Do not commit machine-specific
 paths in `deps/target-deps.packman.xml`.
@@ -111,6 +113,18 @@ paths in `deps/target-deps.packman.xml`.
     <source path="C:/path/to/staged/fbxsdk-packman-layout"/>
 </dependency>
 ```
+
+### FBX NURBS Curves
+
+On Windows x86_64 and Linux x86_64 builds that use Autodesk FBX SDK,
+valid static open, closed, periodic, and rational FBX NURBS curves are
+preserved in USD output as `UsdGeomNurbsCurves`. Curves with invalid order,
+control-point, knot, or parameter-range data that cannot be mapped safely to
+OpenUSD are skipped, and the conversion log reports their names and counts.
+
+Linux aarch64 does not provide this NURBS curve support. This feature preserves
+static curve geometry; it does not add support for animated control-point
+deformation.
 
 ## Usage
 
@@ -126,14 +140,14 @@ usd-convert-asset -i path/to/input.fbx -o path/to/output.usda --progress
 python -m usd_convert_asset -i path/to/input.obj -o path/to/output.usdc
 ```
 
-Common conversion options include `--single-mesh`, `--ignore-materials`,
-`--ignore-animation`, `--preview-surface`, `--fbx-y-up`, `--fbx-z-up`,
-`--stage-up-y`, and `--stage-up-z`.
+Common conversion options include `--single-props-file`, `--ignore-materials`,
+`--ignore-animation`, `--fbx-y-up`, `--fbx-z-up`, `--stage-up-y`, and
+`--stage-up-z`.
 
 Common examples:
 
 ```bash
-# Choose output format by extension: .usd, .usda, or .usdc.
+# Choose output format by extension: .usd, .usda, .usdc, or .usdz.
 usd-convert-asset -i path/to/input.fbx -o path/to/output.usdc
 
 # Convert FBX up-axis and force the output stage to Y-up.
@@ -148,6 +162,9 @@ for asset in assets/*.fbx; do
 done
 ```
 
+USDZ output enables USD Preview Surface automatically when materials are exported.
+Use `--ignore-materials` to create a geometry-only USDZ package.
+
 - More examples/tutorials: `source/python/README.md`
 - API reference: `include/usd_convert_asset.h`
 
@@ -155,32 +172,10 @@ done
 
 - Releases/Changelog: `CHANGELOG.md`
 
-## Contribution Guidelines
+## Contribution Policy
 
-Use GitHub pull requests for code changes and include build or test coverage
-appropriate for the change.
-
-Start with `CONTRIBUTING.md` for contribution requirements.
-
-Before opening a pull request, run a release build and the relevant tests.
-
-Windows:
-
-```powershell
-.\repo.bat build --config release
-.\repo.bat test --config release
-```
-
-Linux:
-
-```bash
-./repo.sh build --config release
-./repo.sh test --config release
-```
-
-The default test suite covers Python unit tests and the C++ Catch2 test binary.
-For Python package changes, also build and install the wheel from `dist/` and run
-a CLI smoke conversion with a small asset.
+This project is not currently accepting external contributions or pull requests.
+See `CONTRIBUTING.md` for the contribution policy and issue-reporting guidance.
 
 ## Governance & Maintainers
 
@@ -203,7 +198,8 @@ triage policy are managed by the repository owners.
 
 ## Community
 
-Use repository issues and pull requests for project communication.
+Use repository issues for project communication. External pull requests are not
+accepted.
 
 ## References
 

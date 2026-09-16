@@ -4,8 +4,12 @@
 import os
 import shutil
 
+# Dependencies that ship compiled binaries must deploy under a per-config folder. Their
+# Debug and Release artifacts share a file name (assimp and tinyxml2 emit no debug postfix),
+# so a shared destination lets one config's install overwrite the other's and leaves the
+# packaged libraries linked against the non-redistributable Debug CRT.
 CONFIGURED_DEPENDENCIES = {
-    "assimp": "assimp",
+    "assimp": os.path.join("assimp", "{config}"),
     "doctest": "doctest",
     "draco": os.path.join("draco", "{config}"),
     "libxml2": os.path.join("libxml2", "{config}"),
@@ -14,7 +18,7 @@ CONFIGURED_DEPENDENCIES = {
     "stb": "stb",
     "tinygltf": "tinygltf",
     "tinyobjloader": os.path.join("tinyobjloader", "{config}"),
-    "tinyxml2": "tinyxml2",
+    "tinyxml2": os.path.join("tinyxml2", "{config}"),
 }
 
 

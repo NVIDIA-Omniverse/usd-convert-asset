@@ -1,6 +1,6 @@
 ---
 name: omniverse-asset-to-usd-asset-conversion
-description: Use when a user asks to convert FBX, OBJ, glTF, GLB, STL, or PLY assets to USD/USDA/USDC with usd-convert-asset, choose CLI flags, validate formats, or troubleshoot conversion output.
+description: Use when a user asks to convert FBX, OBJ, glTF, GLB, STL, or PLY assets to USD/USDA/USDC/USDZ with usd-convert-asset, choose CLI flags, validate formats, or troubleshoot conversion output.
 version: "0.1.0"
 license: Apache-2.0 AND CC-BY-4.0
 metadata:
@@ -17,6 +17,10 @@ tools: [Read, Edit, Shell]
 
 Run supported 3D asset conversions through `usd-convert-asset`, choose conversion flags from user intent, verify input/output formats, and troubleshoot conversion results.
 
+## Tested Wheel Version
+
+This skill was tested against `usd-convert-asset==1.1.0` using the Python 3.12 wheel.
+
 ## When to Use
 
 Use this module when a user asks to convert an asset, choose `usd-convert-asset` CLI flags, troubleshoot conversion output, or inspect supported conversion behavior.
@@ -28,20 +32,20 @@ For installation, source builds, wheel packaging, or first-run smoke tests, load
 - `usd-convert-asset` must be installed in the active Python environment.
 - `usd-convert-asset` uses its bundled OpenUSD runtime. If the surrounding workflow uses another OpenUSD or `usd-core` runtime, run conversion in a separate process from a dedicated virtual environment, or invoke only the converter CLI, to avoid `pxr` conflicts.
 - The source asset must exist and use a supported standalone input extension.
-- The output path must use `.usd`, `.usda`, or `.usdc`.
+- The output path must use `.usd`, `.usda`, `.usdc`, or `.usdz`.
 - Sidecar files such as textures, `.mtl`, `.bin`, `.xml`, or `.mcx` should remain next to the source asset when the format requires them.
 
 ## Supported Formats
 
-Supported standalone input assets are `.fbx`, `.obj`, `.gltf`, `.glb`, `.stl`, and `.ply`. Supported USD output artifacts are `.usd`, `.usda`, and `.usdc`.
+Supported standalone input assets are `.fbx`, `.obj`, `.gltf`, `.glb`, `.stl`, and `.ply`. Supported USD output artifacts are `.usd`, `.usda`, `.usdc`, and `.usdz`.
 
 For format-specific notes and sidecar handling, read `references/format-support.md`.
 
 ## Instructions
 
 1. Confirm the source asset exists and has a supported input extension.
-2. Confirm the requested output path has a supported USD extension.
-3. Choose CLI flags from the user's intent for materials, animation, mesh handling, FBX up-axis conversion, stage up-axis, progress, or debug logging. Use only the flags the user's request requires. Do not add optional flags (for example `--embed-textures` or `--ignore-materials`) unless the user asks for that behavior.
+2. Confirm the requested output path has a supported USD extension (`.usd`, `.usda`, `.usdc`, or `.usdz`). If the user asks for any unsupported input or output format, state that it is unsupported and offer the supported formats. Do not construct the unsupported deliverable using other tools unless the user explicitly asks for a workaround.
+3. Choose CLI flags from the user's intent for materials, animation, mesh handling, FBX up-axis conversion, stage up-axis, progress, or debug logging. Use only the flags the user's request requires. Do not add optional flags (for example `--ignore-materials`) unless the user asks for that behavior.
 4. Run `usd-convert-asset` from the Python environment where the package is installed.
 5. Return the exact command, output path, and any warnings or validation results.
 
@@ -56,6 +60,9 @@ python -m usd_convert_asset -i scene.obj -o scene.usdc
 
 # Print conversion progress
 usd-convert-asset -i scene.fbx -o scene.usdc --progress
+
+# Package as USDZ with portable materials
+usd-convert-asset -i scene.fbx -o scene.usdz
 ```
 
 ## CLI Flags
@@ -104,7 +111,11 @@ For usage guidance or troubleshooting, return a short explanation with the exact
 ## Limitations
 
 - Supported standalone CLI inputs are `.fbx`, `.obj`, `.gltf`, `.glb`, `.stl`, and `.ply`.
+- Supported outputs are `.usd`, `.usda`, `.usdc`, and `.usdz`. Any other format (for example non-USD deliverables such as images) is unsupported; refuse it and offer a supported format rather than packaging or rendering with other tools unless the user explicitly asks for a workaround.
+- For `.usdz`, the CLI enables USD Preview Surface when materials are exported. It then packages a temporary `.usdc` layer with OpenUSD.
 - Sidecars such as `.mtl`, `.mdl`, image files, `.bin`, `.xml`, and `.mcx` are supporting files, not standalone conversion inputs.
+- Linux aarch64 converts FBX through Assimp rather than Autodesk FBX SDK.
+- FBX NURBS curve preservation requires the Autodesk FBX SDK path used on Windows x86_64 and Linux x86_64. Valid static curves are preserved as `UsdGeomNurbsCurves`; invalid curves are skipped with a warning, animated control-point deformation is not covered, and Linux aarch64 does not provide this support.
 - This skill does not cover Gaussian Splat, URDF, CAD-native, or unrelated USD workflows unless `usd-convert-asset` is the relevant converter.
 - High-fidelity Gaussian Splat conversion from `.ply` is not provided here; use a Gaussian Splat-specific converter, such as `usd-convert-gsplat`, for that workflow.
 - The Python package currently exposes version metadata only.

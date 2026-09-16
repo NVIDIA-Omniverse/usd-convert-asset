@@ -22,7 +22,7 @@ protected:
 
     void Log(const std::string& message);
     bool UploadContent(const std::string& path, OmniConverterBlob* blob);
-    size_t GetTotalExportSteps(const StagePtr& stage) const;
+    size_t GetTotalExportSteps(const StagePtr& stage, bool includeCurves = false) const;
 
 protected:
 

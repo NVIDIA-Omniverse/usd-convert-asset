@@ -769,17 +769,32 @@ enum class CurveWrap
     Pinned,
 };
 
+enum class CurveSchema
+{
+    Basis,
+    Nurbs,
+};
+
 struct Curve
 {
     std::string name;
-    CurveType type;
-    CurveBasis basis;
-    CurveWrap wrap;
+    CurveSchema schema = CurveSchema::Basis;
+    CurveType type = CurveType::Cubic;
+    CurveBasis basis = CurveBasis::Bspline;
+    CurveWrap wrap = CurveWrap::NonPeriodic;
     PXR_NS::VtIntArray vertexCounts;
     PXR_NS::VtArray<PXR_NS::GfVec3f> points;
     PXR_NS::VtArray<PXR_NS::GfVec2f> uvs;
     PXR_NS::VtArray<float> width;
-    uint32_t subdivPerSegment;
+    uint32_t subdivPerSegment = 1;
+
+    // NurbsCurves schema data. FBX closed and periodic curves have implicit
+    // repeated control points; importers must expand them before populating
+    // these arrays so that knots.size() == points.size() + orders[0].
+    PXR_NS::VtIntArray orders;
+    PXR_NS::VtArray<double> knots;
+    PXR_NS::VtArray<PXR_NS::GfVec2d> ranges;
+    PXR_NS::VtArray<double> pointWeights;
 };
 using CurvePtr = std::shared_ptr<Curve>;
 

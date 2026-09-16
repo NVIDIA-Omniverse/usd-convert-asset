@@ -8,7 +8,7 @@ Use this reference only when the published `usd-convert-asset` package is unavai
 ## Build Preparation
 
 1. Inspect the local OS, architecture, and build configuration.
-2. If the target architecture is ARM64/aarch64, skip FBX SDK setup because Autodesk FBX SDK is not supported for that target; FBX conversion uses Assimp instead.
+2. If the target architecture is Linux ARM64/aarch64, skip FBX SDK setup because Autodesk FBX SDK is not supported for that target. FBX conversion uses Assimp instead.
 3. For Windows x86_64, Visual Studio 2019 or 2022 must be installed. The build tools auto-detect the latest installed version among those supported releases only. Check or set `repo.toml`'s `repo_build.msbuild.vs_version` if you need to target a specific supported Visual Studio version.
 4. For Windows x86_64 and Linux x86_64 source builds, find the Autodesk FBX SDK download instructions from `https://aps.autodesk.com/developer/overview/fbx-sdk` and locate FBX SDK `2020.3.7`.
 5. Ask the user to download/run the Autodesk installer and review and accept Autodesk license terms themselves.

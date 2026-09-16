@@ -6,8 +6,11 @@
 #include "../../common/common.h"
 #include "../../utils/utils.h"
 
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <stack>
+#include <unordered_map>
 
 #define ENSURE_STATUS_OK(status)                                                                                                                     \
     {                                                                                                                                                \
@@ -35,6 +38,7 @@ PXR_NAMESPACE_OPEN_SCOPE
 TF_DEFINE_PRIVATE_TOKENS(
     _tokens,
     ((mesh, "Mesh"))
+    ((nurbsCurves, "NurbsCurves"))
     ((points, "points"))
     ((Points, "Points"))
     ((rangeMin, "range:min"))
@@ -96,6 +100,74 @@ static PXR_NS::TfToken ProjectionToToken(PXR_NS::GfCamera::Projection projection
         default:
             return PXR_NS::UsdGeomTokens->perspective;
     }
+}
+
+static PXR_NS::VtArray<PXR_NS::GfVec3f> ComputeCurveExtent(const CurvePtr& curve)
+{
+    PXR_NS::VtArray<PXR_NS::GfVec3f> extent;
+    if (curve->width.empty())
+    {
+        PXR_NS::UsdGeomPointBased::ComputeExtent(curve->points, &extent);
+    }
+    else
+    {
+        PXR_NS::UsdGeomCurves::ComputeExtent(curve->points, curve->width, &extent);
+    }
+    return extent;
+}
+
+template <size_t Dimension>
+struct FloatArrayHash
+{
+    size_t operator()(const std::array<float, Dimension>& key) const
+    {
+        size_t hash = 0;
+        for (const float component : key)
+        {
+            hash ^= std::hash<float>{}(component) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        }
+        return hash;
+    }
+};
+
+template <size_t Dimension, typename VecType>
+static std::pair<PXR_NS::VtArray<VecType>, PXR_NS::VtIntArray> DeduplicatePrimvarValues(const PXR_NS::VtArray<VecType>& values)
+{
+    PXR_NS::VtArray<VecType> uniqueValues;
+    uniqueValues.reserve(values.size());
+
+    PXR_NS::VtIntArray valueIndices;
+    valueIndices.reserve(values.size());
+
+    std::unordered_map<std::array<float, Dimension>, int, FloatArrayHash<Dimension>> uniqueValueIndices;
+    uniqueValueIndices.reserve(values.size());
+    for (const auto& value : values)
+    {
+        std::array<float, Dimension> key;
+        bool finiteValue = true;
+        for (size_t component = 0; component < Dimension; ++component)
+        {
+            key[component] = value[component];
+            finiteValue = finiteValue && std::isfinite(key[component]);
+        }
+
+        if (!finiteValue)
+        {
+            valueIndices.push_back(static_cast<int>(uniqueValues.size()));
+            uniqueValues.push_back(value);
+            continue;
+        }
+
+        const int nextIndex = static_cast<int>(uniqueValues.size());
+        const auto result = uniqueValueIndices.emplace(key, nextIndex);
+        if (result.second)
+        {
+            uniqueValues.push_back(value);
+        }
+        valueIndices.push_back(result.first->second);
+    }
+
+    return { std::move(uniqueValues), std::move(valueIndices) };
 }
 
 static PXR_NS::SdfPrimSpecHandle GetOrCreatePrimSpec(
@@ -397,6 +469,109 @@ static bool AllNormalsAreZero(const PXR_NS::VtArray<PXR_NS::GfVec3f>& normals)
     return true; // All normals are zero
 }
 
+static bool GetValidMeshNormals(
+    const Mesh& mesh,
+    const PXR_NS::VtArray<PXR_NS::GfVec3f>& points,
+    const PXR_NS::VtArray<PXR_NS::GfVec3f>& normals,
+    PXR_NS::VtArray<PXR_NS::GfVec3f>* validNormals
+)
+{
+    const bool hasVertexNormals = !mesh.hasFaceVaryingNormals && normals.size() == points.size();
+    const bool hasFaceVaryingNormals = !hasVertexNormals && normals.size() == mesh.faceVertexIndices.size();
+    validNormals->assign(mesh.faceVertexIndices.size(), PXR_NS::GfVec3f(0.0f));
+    size_t faceVertexOffset = 0;
+    for (int faceVertexCount : mesh.faceVertexCounts)
+    {
+        if (faceVertexCount < 0 || faceVertexOffset + size_t(faceVertexCount) > mesh.faceVertexIndices.size())
+        {
+            return false;
+        }
+
+        PXR_NS::GfVec3f faceNormal(0.0f);
+        bool hasFaceNormal = false;
+        if (faceVertexCount >= 3)
+        {
+            const int pointIndex0 = mesh.faceVertexIndices[faceVertexOffset];
+            if (pointIndex0 >= 0 && size_t(pointIndex0) < points.size())
+            {
+                PXR_NS::GfVec3f accumulatedFaceNormal(0.0f);
+                PXR_NS::GfVec3f fallbackFaceNormal(0.0f);
+                bool hasFallbackFaceNormal = false;
+                for (int triangleIndex = 1; triangleIndex + 1 < faceVertexCount; ++triangleIndex)
+                {
+                    const int pointIndex1 = mesh.faceVertexIndices[faceVertexOffset + triangleIndex];
+                    const int pointIndex2 = mesh.faceVertexIndices[faceVertexOffset + triangleIndex + 1];
+                    if (pointIndex1 < 0 || pointIndex2 < 0 || size_t(pointIndex1) >= points.size() || size_t(pointIndex2) >= points.size())
+                    {
+                        continue;
+                    }
+
+                    const PXR_NS::GfVec3f triangleNormal = (points[pointIndex1] - points[pointIndex0]) ^ (points[pointIndex2] - points[pointIndex0]);
+                    const float triangleNormalLengthSquared = triangleNormal.GetLengthSq();
+                    if (std::isfinite(triangleNormalLengthSquared))
+                    {
+                        accumulatedFaceNormal += triangleNormal;
+                        if (!hasFallbackFaceNormal && triangleNormalLengthSquared > 1e-12f)
+                        {
+                            fallbackFaceNormal = triangleNormal / std::sqrt(triangleNormalLengthSquared);
+                            hasFallbackFaceNormal = true;
+                        }
+                    }
+                }
+
+                const float accumulatedFaceNormalLengthSquared = accumulatedFaceNormal.GetLengthSq();
+                if (std::isfinite(accumulatedFaceNormalLengthSquared) && accumulatedFaceNormalLengthSquared > 1e-12f)
+                {
+                    faceNormal = accumulatedFaceNormal / std::sqrt(accumulatedFaceNormalLengthSquared);
+                    hasFaceNormal = true;
+                }
+                else if (hasFallbackFaceNormal)
+                {
+                    faceNormal = fallbackFaceNormal;
+                    hasFaceNormal = true;
+                }
+            }
+        }
+        if (!hasFaceNormal)
+        {
+            faceNormal = PXR_NS::GfVec3f(0.0f, 0.0f, 1.0f);
+        }
+
+        for (int faceVertexIndex = 0; faceVertexIndex < faceVertexCount; ++faceVertexIndex)
+        {
+            auto& normal = (*validNormals)[faceVertexOffset + faceVertexIndex];
+            if (hasFaceVaryingNormals)
+            {
+                normal = normals[faceVertexOffset + faceVertexIndex];
+            }
+            else if (hasVertexNormals)
+            {
+                const int pointIndex = mesh.faceVertexIndices[faceVertexOffset + faceVertexIndex];
+                if (pointIndex >= 0 && size_t(pointIndex) < normals.size())
+                {
+                    normal = normals[pointIndex];
+                }
+            }
+            const float normalLengthSquared = normal.GetLengthSq();
+            if (std::isfinite(normalLengthSquared) && normalLengthSquared > 1e-12f)
+            {
+                normal /= std::sqrt(normalLengthSquared);
+                if (hasFaceNormal && normal * faceNormal < 0.0f)
+                {
+                    normal = -normal;
+                }
+            }
+            else
+            {
+                normal = faceNormal;
+            }
+        }
+        faceVertexOffset += faceVertexCount;
+    }
+
+    return faceVertexOffset == mesh.faceVertexIndices.size();
+}
+
 // Necessary for GCC
 namespace
 {
@@ -678,6 +853,7 @@ PXR_NS::SdfVariantSpecHandle AddVariant(PXR_NS::SdfPrimSpecHandle defaultPrimSpe
 OmniConverterStatus UsdExporter::Export(const StagePtr& stage, std::string& detailedError)
 {
     Log("Starting to export asset with USD exporter.");
+    mExportedCurveIndices.clear();
 
     std::string realExportRoot;
     std::string realMainUsdPath;
@@ -746,7 +922,7 @@ OmniConverterStatus UsdExporter::Export(const StagePtr& stage, std::string& deta
     }
     mAnimationsExportRoot = PathUtils::JoinPaths(tempExportRoot, ANIMATION_DIR_NAME);
 
-    uint32_t totalSteps = GetTotalExportSteps(stage);
+    uint32_t totalSteps = GetTotalExportSteps(stage, true);
     mExportContext->StartProgress(totalSteps);
 
     if (!stage->rootNode)
@@ -919,6 +1095,32 @@ PXR_NS::SdfLayerRefPtr UsdExporter::GetOrCreateLayer(const std::string& realStag
     return targetLayer;
 }
 
+std::string UsdExporter::ReserveUniqueUploadPath(const std::string& targetPath)
+{
+    if (mUploadedTargetPaths.insert(StringUtils::ToLower(targetPath)).second)
+    {
+        return targetPath;
+    }
+
+    const std::string directory = PathUtils::GetDirName(targetPath);
+    const std::string baseName = PathUtils::GetFileName(targetPath);
+    const std::string extension = PathUtils::GetExtension(targetPath);
+    for (size_t suffix = 1;; ++suffix)
+    {
+        std::string fileName = baseName + "_" + std::to_string(suffix);
+        if (!extension.empty())
+        {
+            fileName += "." + extension;
+        }
+
+        std::string uniquePath = PathUtils::JoinPaths(directory, fileName);
+        if (mUploadedTargetPaths.insert(StringUtils::ToLower(uniquePath)).second)
+        {
+            return uniquePath;
+        }
+    }
+}
+
 OmniConverterStatus UsdExporter::UploadTextureIfNotEmpty(const TextureImagePtr& texture, std::string& detailedError)
 {
     if (!texture)
@@ -928,25 +1130,35 @@ OmniConverterStatus UsdExporter::UploadTextureIfNotEmpty(const TextureImagePtr& 
 
     if (texture->blob)
     {
-        const std::string& filename = PathUtils::GetFileName(texture->originalPath, true);
+        std::string filename = PathUtils::GetFileName(texture->originalPath, true);
+        if (StringUtils::ToLower(PathUtils::GetExtension(filename)) == "jpeg")
+        {
+            filename = PathUtils::GetFileName(filename) + ".jpg";
+        }
         std::string targetPath = PathUtils::JoinPaths(mTexturesExportRoot, filename);
         if (PathUtils::GetExtension(targetPath).empty())
         {
             targetPath += ".png"; // Assumes png by default
         }
 
-        // It's possible that the same texture has been included twice inside original asset.
-        if (mUploadedFiles.find(targetPath) == mUploadedFiles.end())
+        targetPath = ReserveUniqueUploadPath(targetPath);
+        if (!UploadContent(targetPath, texture->blob.get()))
         {
-            UploadContent(targetPath, texture->blob.get());
-            mUploadedFiles[targetPath] = targetPath;
+            detailedError = "Failed to write texture " + targetPath + ".";
+            Log(detailedError);
+            return OmniConverterStatus::FILE_WRITE_ERROR;
         }
+        mUploadedFiles[targetPath] = targetPath;
         mTextureUploadPath[texture] = targetPath;
         mExportContext->IncrementProgress();
     }
     else
     {
-        UploadFileInternal(texture->realPath, mTexturesExportRoot, detailedError);
+        const auto status = UploadFileInternal(texture->realPath, mTexturesExportRoot, detailedError);
+        if (status != OmniConverterStatus::OK)
+        {
+            return status;
+        }
         mTextureUploadPath[texture] = mUploadedFiles[texture->realPath];
     }
 
@@ -958,15 +1170,19 @@ OmniConverterStatus UsdExporter::UploadFileInternal(const std::string& filePath,
     auto iter = mUploadedFiles.find(filePath);
     if (iter == mUploadedFiles.end())
     {
-        const std::string& fileName = PathUtils::GetFileName(filePath, true);
-        const std::string& outFilePath = PathUtils::JoinPaths(targetDir, fileName);
-        mUploadedFiles[filePath] = outFilePath;
+        std::string fileName = PathUtils::GetFileName(filePath, true);
+        if (StringUtils::ToLower(PathUtils::GetExtension(fileName)) == "jpeg")
+        {
+            fileName = PathUtils::GetFileName(fileName) + ".jpg";
+        }
+        const std::string outFilePath = ReserveUniqueUploadPath(PathUtils::JoinPaths(targetDir, fileName));
         if (!mExportContext->converterContext.CopyFile(outFilePath, filePath))
         {
             detailedError = "Failed to copy file " + filePath + " to " + outFilePath + ".";
             Log(detailedError);
             return OmniConverterStatus::CANCELLED;
         }
+        mUploadedFiles[filePath] = outFilePath;
     }
     mExportContext->IncrementProgress();
 
@@ -1030,18 +1246,68 @@ void UsdExporter::PreprocessStage(const StagePtr& stage)
     }
 }
 
+UsdExporter::MeshExportResult UsdExporter::PrepareMeshForExport(
+    const StagePtr& stage,
+    const MeshPtr& mesh,
+    const std::string& meshDisplayName,
+    OmniConverterStatus& status,
+    std::string& detailedError
+)
+{
+    // ASSIMP mesh data may contain point clouds (face vertex data is empty).
+    if (!mesh->points.empty() && mesh->faceVertexCounts.empty() && mesh->faceVertexIndices.empty())
+    {
+        return MeshExportResult::PointCloud;
+    }
+
+    auto& meshInfo = mMeshPrimInfos[mesh];
+    const bool shouldCompactMesh = !meshInfo.meshCompactionComplete;
+    if (shouldCompactMesh)
+    {
+        if (!StageUtils::CompactMeshPoints(stage, mesh))
+        {
+            const std::string& meshName = mesh->name.empty() ? meshDisplayName : mesh->name;
+            detailedError = "Failed to compact points for mesh '" + meshName + "' because it has invalid point indices or point data sizes.";
+            Log(detailedError);
+            status = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
+            return MeshExportResult::Error;
+        }
+        meshInfo.meshCompactionComplete = true;
+    }
+
+    if (mesh->points.empty() || mesh->faceVertexCounts.empty() || mesh->faceVertexIndices.empty())
+    {
+        if (shouldCompactMesh)
+        {
+            const std::string& meshName = mesh->name.empty() ? meshDisplayName : mesh->name;
+            Log("Skips mesh '" + meshName + "' because it contains no exportable geometry.");
+        }
+        return MeshExportResult::Skip;
+    }
+
+    return MeshExportResult::Mesh;
+}
+
 PXR_NS::SdfPrimSpecHandle UsdExporter::BindOrDefineMesh(
     const StagePtr& stage,
     const MeshPtr& mesh,
     PXR_NS::SdfLayerRefPtr usdLayer,
     const PXR_NS::SdfPath& instancePath,
     bool instanceable,
-    const std::string& instanceDisplayName
+    const std::string& instanceDisplayName,
+    OmniConverterStatus& status,
+    std::string& detailedError
 )
 {
-    // ASSIMP mesh data may contain point clouds (face vertex data is empty)
-    bool isPointCloud = !mesh->points.empty() && mesh->faceVertexCounts.size() == 0;
+    const MeshExportResult exportResult = PrepareMeshForExport(stage, mesh, instanceDisplayName, status, detailedError);
+    if (exportResult == MeshExportResult::Error || exportResult == MeshExportResult::Skip)
+    {
+        return {};
+    }
+
+    const bool isPointCloud = exportResult == MeshExportResult::PointCloud;
     auto& meshInfo = mMeshPrimInfos[mesh];
+
     if (meshInfo.meshInstanceCount > 1)
     {
         // Define instance
@@ -1060,7 +1326,11 @@ PXR_NS::SdfPrimSpecHandle UsdExporter::BindOrDefineMesh(
                 }
                 else
                 {
-                    auto usdMesh = ExportMeshInternal(usdLayer, stage, mesh, instancePath, instanceDisplayName);
+                    auto usdMesh = ExportMeshInternal(usdLayer, stage, mesh, instancePath, instanceDisplayName, status, detailedError);
+                    if (status != OmniConverterStatus::OK)
+                    {
+                        return {};
+                    }
                     usdMesh->SetTypeName(PXR_NS::_tokens->mesh);
                     meshInfo.prototypePrimPath = usdMesh->GetPath();
                     return usdMesh;
@@ -1112,7 +1382,7 @@ PXR_NS::SdfPrimSpecHandle UsdExporter::BindOrDefineMesh(
         }
         else
         {
-            return ExportMeshInternal(usdLayer, stage, mesh, instancePath, instanceDisplayName);
+            return ExportMeshInternal(usdLayer, stage, mesh, instancePath, instanceDisplayName, status, detailedError);
         }
     }
 }
@@ -1155,7 +1425,18 @@ OmniConverterStatus UsdExporter::ExportTextures(const StagePtr& stage, std::stri
             {
                 if (!material->builtIn)
                 {
-                    UploadFileInternal(material->materialPath, mMaterialsExportRoot, detailedError);
+                    const auto status = UploadFileInternal(material->materialPath, mMaterialsExportRoot, detailedError);
+                    if (status != OmniConverterStatus::OK)
+                    {
+                        if (mExportContext->IsExited())
+                        {
+                            return OmniConverterStatus::CANCELLED;
+                        }
+
+                        Log("Skips material " + material->name + " because its file copy failed.");
+                        detailedError.clear();
+                        continue;
+                    }
                 }
 
                 for (const auto& property : material->inputProperties)
@@ -1167,7 +1448,17 @@ OmniConverterStatus UsdExporter::ExportTextures(const StagePtr& stage, std::stri
 
                     if (property.isTextureProperty)
                     {
-                        UploadFileInternal(property.stringValue, mTexturesExportRoot, detailedError);
+                        const auto status = UploadFileInternal(property.stringValue, mTexturesExportRoot, detailedError);
+                        if (status != OmniConverterStatus::OK)
+                        {
+                            if (mExportContext->IsExited())
+                            {
+                                return OmniConverterStatus::CANCELLED;
+                            }
+
+                            Log("Skips texture property " + property.name + " from material " + material->name + " because its file copy failed.");
+                            detailedError.clear();
+                        }
                     }
                 }
             }
@@ -1196,7 +1487,28 @@ OmniConverterStatus UsdExporter::ExportTextures(const StagePtr& stage, std::stri
 
         Log("Exporting texture " + std::to_string(index));
         TextureImagePtr texture = stage->images[index];
-        UploadTextureIfNotEmpty(texture, detailedError);
+        const auto status = UploadTextureIfNotEmpty(texture, detailedError);
+        if (status != OmniConverterStatus::OK)
+        {
+            if (mExportContext->IsExited())
+            {
+                return OmniConverterStatus::CANCELLED;
+            }
+
+            Log("Skips texture " + std::to_string(index) + " and uses material values.");
+            for (const auto& material : stage->materials)
+            {
+                for (size_t type = (size_t)MaterialTextureType::START; type < (size_t)MaterialTextureType::END; ++type)
+                {
+                    auto& textureReference = material->GetTextureReference((MaterialTextureType)type);
+                    if (textureReference.IsValid() && textureReference.imageIndex == index)
+                    {
+                        material->ClearTextureReference((MaterialTextureType)type);
+                    }
+                }
+            }
+            detailedError.clear();
+        }
         ClearInMemoryTexture(texture);
         mExportContext->IncrementProgress();
     }
@@ -1224,13 +1536,36 @@ OmniConverterStatus UsdExporter::ExportInstancedMeshes(const StagePtr& stage, st
             continue;
         }
 
-        NameInfo meshNameInfo = GetNameInfo(mesh->name, "mesh", uniqueMeshFileNames);
+        OmniConverterStatus meshStatus = OmniConverterStatus::OK;
+        const MeshExportResult exportResult = PrepareMeshForExport(stage, mesh, mesh->name, meshStatus, detailedError);
+        if (exportResult == MeshExportResult::Error)
+        {
+            return meshStatus;
+        }
+        if (exportResult == MeshExportResult::Skip)
+        {
+            continue;
+        }
+
+        const bool isPointCloud = exportResult == MeshExportResult::PointCloud;
+        NameInfo meshNameInfo = GetNameInfo(mesh->name, isPointCloud ? "point_cloud" : "mesh", uniqueMeshFileNames);
 
         // Layer path for separate mesh export
         std::string layerPath = PathUtils::JoinPaths(mPropsExportRoot, meshNameInfo.name + USD_FILE_EXT);
         PXR_NS::SdfLayerRefPtr usdLayer = GetOrCreateLayer(layerPath, stage->yAxis, stage->worldUnits);
         auto meshPath = mCommonRootPath.AppendElementString(meshNameInfo.name);
-        ExportMeshInternal(usdLayer, stage, mesh, meshPath, meshNameInfo.displayName);
+        if (isPointCloud)
+        {
+            ExportPointCloud(usdLayer, stage, mesh, meshPath, meshNameInfo.displayName);
+        }
+        else
+        {
+            ExportMeshInternal(usdLayer, stage, mesh, meshPath, meshNameInfo.displayName, meshStatus, detailedError);
+            if (meshStatus != OmniConverterStatus::OK)
+            {
+                return meshStatus;
+            }
+        }
         ENSURE_STATUS_OK(WriteLayerTo(usdLayer, layerPath, detailedError));
     }
 
@@ -1264,7 +1599,7 @@ OmniConverterStatus UsdExporter::ExportStageTree(const StagePtr& stage, std::str
 
     NameUtils::NameCache nodeInstanceNameCount;
     Log("Starting to author USD stage tree.");
-    ENSURE_STATUS_OK(TraverseAndExport(stage, stage->rootNode, usdLayer, PXR_NS::SdfPath::AbsoluteRootPath(), nodeInstanceNameCount));
+    ENSURE_STATUS_OK(TraverseAndExport(stage, stage->rootNode, usdLayer, PXR_NS::SdfPath::AbsoluteRootPath(), nodeInstanceNameCount, detailedError));
     Log("Finished authoring USD stage tree.");
 
     ENSURE_STATUS_OK(WriteLayerTo(usdLayer, mPropsFilePath, detailedError));
@@ -1494,7 +1829,8 @@ OmniConverterStatus UsdExporter::TraverseAndExport(
     const StageNodePtr& stageNode,
     PXR_NS::SdfLayerRefPtr usdLayer,
     const PXR_NS::SdfPath& parentPrimPath,
-    NameUtils::NameCache& uniqueNameCount
+    NameUtils::NameCache& uniqueNameCount,
+    std::string& detailedError
 )
 {
     // Skip empty node
@@ -1542,8 +1878,62 @@ OmniConverterStatus UsdExporter::TraverseAndExport(
         std::string primNamePrefix = (mesh->faceVertexCounts.size() == 0) ? "point_cloud" : "mesh";
         NameInfo instanceNameInfo = GetNameInfo(mesh->name, primNamePrefix, uniqueInstanceNameCount);
         instancePath = nodePrimPath.AppendElementString(instanceNameInfo.name);
-        BindOrDefineMesh(stage, mesh, usdLayer, instancePath, !mExportContext->converterContext.DisableInstancing(), instanceNameInfo.displayName);
+        OmniConverterStatus meshStatus = OmniConverterStatus::OK;
+        BindOrDefineMesh(
+            stage,
+            mesh,
+            usdLayer,
+            instancePath,
+            !mExportContext->converterContext.DisableInstancing(),
+            instanceNameInfo.displayName,
+            meshStatus,
+            detailedError
+        );
+        if (meshStatus != OmniConverterStatus::OK)
+        {
+            return meshStatus;
+        }
         stageNodeInfo.meshInstancePaths[i] = instancePath;
+    }
+
+    // Export curve instances.
+    for (size_t curveIndex : stageNode->curveInstances)
+    {
+        if (mExportContext->IsExited())
+        {
+            return OmniConverterStatus::CANCELLED;
+        }
+        if (curveIndex >= stage->curves.size())
+        {
+            continue;
+        }
+
+        const CurvePtr& curve = stage->curves[curveIndex];
+        const bool isFirstCurveInstance = mExportedCurveIndices.insert(curveIndex).second;
+        if (!curve || curve->schema != CurveSchema::Nurbs)
+        {
+            if (isFirstCurveInstance)
+            {
+                if (!curve)
+                {
+                    Log("[WARNING] Skipping null curve during USD export.");
+                }
+                mExportContext->IncrementProgress();
+            }
+            continue;
+        }
+
+        const NameInfo curveNameInfo = GetNameInfo(curve->name, "curve", uniqueInstanceNameCount);
+        const PXR_NS::SdfPath curvePath = nodePrimPath.AppendElementString(curveNameInfo.name);
+        const PXR_NS::SdfPrimSpecHandle curveSpec = ExportCurve(usdLayer, curve, curvePath, curveNameInfo.displayName);
+        if (!curveSpec && isFirstCurveInstance)
+        {
+            Log("[WARNING] Skipping invalid curve '" + curveNameInfo.displayName + "' during USD export.");
+        }
+        if (isFirstCurveInstance)
+        {
+            mExportContext->IncrementProgress();
+        }
     }
 
     // Export lights
@@ -1681,14 +2071,19 @@ OmniConverterStatus UsdExporter::TraverseAndExport(
         NameInfo skeletonNameInfo = GetNameInfo(skeletonName, "skeleton", uniqueInstanceNameCount);
         PXR_NS::SdfPath usdSkelRootPath = parentPrimPath.AppendElementString(skeletonNameInfo.name);
         GetOrCreatePrimSpec(usdLayer, usdSkelRootPath, PXR_NS::_tokens->skelRootType, true, skeletonNameInfo.displayName);
-        ExportSkeletonAndSkinning(stage, stageNode, usdLayer, usdSkelRootPath);
+        OmniConverterStatus skeletonStatus = OmniConverterStatus::OK;
+        ExportSkeletonAndSkinning(stage, stageNode, usdLayer, usdSkelRootPath, skeletonStatus, detailedError);
+        if (skeletonStatus != OmniConverterStatus::OK)
+        {
+            return skeletonStatus;
+        }
         stageNodeInfo.nodeSkelRootPath = usdSkelRootPath;
     }
 
     // Save context
     for (size_t i = 0; i < stageNode->children.size(); i++)
     {
-        ENSURE_STATUS_OK(TraverseAndExport(stage, stageNode->children[i], usdLayer, nodePrimPath, uniqueInstanceNameCount));
+        ENSURE_STATUS_OK(TraverseAndExport(stage, stageNode->children[i], usdLayer, nodePrimPath, uniqueInstanceNameCount, detailedError));
     }
 
     return OmniConverterStatus::OK;
@@ -1698,7 +2093,9 @@ PXR_NS::SdfPrimSpecHandle UsdExporter::ExportSkeletonAndSkinning(
     const StagePtr& stage,
     const StageNodePtr& rootBone,
     PXR_NS::SdfLayerRefPtr usdLayer,
-    const PXR_NS::SdfPath& skeletonRootPath
+    const PXR_NS::SdfPath& skeletonRootPath,
+    OmniConverterStatus& status,
+    std::string& detailedError
 )
 {
     auto skeletonPath = skeletonRootPath.AppendElementString(SKELETON_PRIM_NAME);
@@ -1771,7 +2168,12 @@ PXR_NS::SdfPrimSpecHandle UsdExporter::ExportSkeletonAndSkinning(
 
         NameInfo meshNameInfo = GetNameInfo(mesh->name, "mesh", uniqueSkinMeshNameCount);
         const auto& meshPrimPath = skeletonRootPath.AppendElementString(meshNameInfo.name);
-        PXR_NS::SdfPrimSpecHandle meshPrim = BindOrDefineMesh(stage, mesh, usdLayer, meshPrimPath, false, meshNameInfo.displayName);
+        PXR_NS::SdfPrimSpecHandle
+            meshPrim = BindOrDefineMesh(stage, mesh, usdLayer, meshPrimPath, false, meshNameInfo.displayName, status, detailedError);
+        if (status != OmniConverterStatus::OK)
+        {
+            return {};
+        }
         if (!meshPrim)
         {
             continue;
@@ -1907,13 +2309,112 @@ PXR_NS::SdfPrimSpecHandle UsdExporter::ExportPointCloud(
     return usdPointCloudSpec;
 }
 
+PXR_NS::SdfPrimSpecHandle UsdExporter::ExportCurve(
+    PXR_NS::SdfLayerRefPtr usdLayer,
+    const CurvePtr& curve,
+    const PXR_NS::SdfPath& curvePath,
+    const std::string& curveDisplayName
+)
+{
+    if (!curve)
+    {
+        return PXR_NS::SdfPrimSpecHandle();
+    }
+
+    if (curve->schema != CurveSchema::Nurbs)
+    {
+        return PXR_NS::SdfPrimSpecHandle();
+    }
+    return ExportNurbsCurve(usdLayer, curve, curvePath, curveDisplayName);
+}
+
+PXR_NS::SdfPrimSpecHandle UsdExporter::ExportNurbsCurve(
+    PXR_NS::SdfLayerRefPtr usdLayer,
+    const CurvePtr& curve,
+    const PXR_NS::SdfPath& curvePath,
+    const std::string& curveDisplayName
+)
+{
+    if (curve->points.empty() || curve->vertexCounts.size() != curve->orders.size() || curve->orders.size() != curve->ranges.size() ||
+        curve->knots.empty() || (!curve->pointWeights.empty() && curve->pointWeights.size() != curve->points.size()))
+    {
+        return PXR_NS::SdfPrimSpecHandle();
+    }
+
+    size_t pointCount = 0;
+    size_t knotCount = 0;
+    size_t knotOffset = 0;
+    for (size_t i = 0; i < curve->vertexCounts.size(); ++i)
+    {
+        const int vertexCount = curve->vertexCounts[i];
+        const int order = curve->orders[i];
+        if (vertexCount <= 0 || order <= 0 || order > vertexCount)
+        {
+            return PXR_NS::SdfPrimSpecHandle();
+        }
+
+        pointCount += vertexCount;
+        knotCount += vertexCount + order;
+        const size_t curveKnotCount = vertexCount + order;
+        if (knotOffset + curveKnotCount > curve->knots.size() ||
+            !std::is_sorted(curve->knots.begin() + knotOffset, curve->knots.begin() + knotOffset + curveKnotCount))
+        {
+            return PXR_NS::SdfPrimSpecHandle();
+        }
+
+        const PXR_NS::GfVec2d& range = curve->ranges[i];
+        const double domainMin = curve->knots[knotOffset + order - 1];
+        const double domainMax = curve->knots[knotOffset + vertexCount];
+        if (range[0] >= range[1] || range[0] < domainMin || range[1] > domainMax)
+        {
+            return PXR_NS::SdfPrimSpecHandle();
+        }
+        knotOffset += curveKnotCount;
+    }
+    if (pointCount != curve->points.size() || knotCount != curve->knots.size())
+    {
+        return PXR_NS::SdfPrimSpecHandle();
+    }
+
+    auto usdCurveSpec = GetOrCreatePrimSpec(usdLayer, curvePath, PXR_NS::_tokens->nurbsCurves, true, curveDisplayName);
+    CreateAndSetAttrSpec(
+        usdCurveSpec,
+        PXR_NS::UsdGeomTokens->curveVertexCounts,
+        PXR_NS::SdfValueTypeNames->IntArray,
+        PXR_NS::VtValue(curve->vertexCounts)
+    );
+    CreateAndSetAttrSpec(usdCurveSpec, PXR_NS::_tokens->points, PXR_NS::SdfValueTypeNames->Point3fArray, PXR_NS::VtValue(curve->points));
+    CreateAndSetAttrSpec(usdCurveSpec, PXR_NS::UsdGeomTokens->order, PXR_NS::SdfValueTypeNames->IntArray, PXR_NS::VtValue(curve->orders));
+    CreateAndSetAttrSpec(usdCurveSpec, PXR_NS::UsdGeomTokens->knots, PXR_NS::SdfValueTypeNames->DoubleArray, PXR_NS::VtValue(curve->knots));
+    CreateAndSetAttrSpec(usdCurveSpec, PXR_NS::UsdGeomTokens->ranges, PXR_NS::SdfValueTypeNames->Double2Array, PXR_NS::VtValue(curve->ranges));
+    if (!curve->pointWeights.empty())
+    {
+        CreateAndSetAttrSpec(
+            usdCurveSpec,
+            PXR_NS::UsdGeomTokens->pointWeights,
+            PXR_NS::SdfValueTypeNames->DoubleArray,
+            PXR_NS::VtValue(curve->pointWeights)
+        );
+    }
+    if (!curve->width.empty())
+    {
+        CreateAndSetAttrSpec(usdCurveSpec, PXR_NS::UsdGeomTokens->widths, PXR_NS::SdfValueTypeNames->FloatArray, PXR_NS::VtValue(curve->width));
+    }
+
+    const PXR_NS::VtArray<PXR_NS::GfVec3f> extent = ComputeCurveExtent(curve);
+    CreateAndSetAttrSpec(usdCurveSpec, PXR_NS::UsdGeomTokens->extent, PXR_NS::SdfValueTypeNames->Float3Array, PXR_NS::VtValue(extent));
+    return usdCurveSpec;
+}
+
 
 PXR_NS::SdfPrimSpecHandle UsdExporter::ExportMeshInternal(
     PXR_NS::SdfLayerRefPtr usdLayer,
     const StagePtr& stage,
     const MeshPtr& mesh,
     const PXR_NS::SdfPath& meshPath,
-    const std::string& meshDisplayName
+    const std::string& meshDisplayName,
+    OmniConverterStatus& status,
+    std::string& detailedError
 )
 {
     auto usdMeshSpec = usdLayer->GetPrimAtPath(meshPath);
@@ -1923,6 +2424,13 @@ PXR_NS::SdfPrimSpecHandle UsdExporter::ExportMeshInternal(
     }
 
     usdMeshSpec = GetOrCreatePrimSpec(usdLayer, meshPath, PXR_NS::_tokens->mesh, true, meshDisplayName);
+    auto subdivisionAttrSpec = CreateAndSetAttrSpec(
+        usdMeshSpec,
+        PXR_NS::UsdGeomTokens->subdivisionScheme,
+        PXR_NS::SdfValueTypeNames->Token,
+        PXR_NS::VtValue(PXR_NS::UsdGeomTokens->none),
+        PXR_NS::SdfVariabilityUniform
+    );
     if (mesh->points.empty() || mesh->faceVertexCounts.empty() || mesh->faceVertexIndices.empty())
     {
         return usdMeshSpec;
@@ -1968,30 +2476,53 @@ PXR_NS::SdfPrimSpecHandle UsdExporter::ExportMeshInternal(
         if (!mesh->colors.empty())
         {
             // TODO : set multi colors
+            auto colorData = DeduplicatePrimvarValues<3>(mesh->colors[0]);
             auto colorAttrSpec = CreateAndSetAttrSpec(
                 usdMeshSpec,
                 PXR_NS::UsdGeomTokens->primvarsDisplayColor,
                 PXR_NS::SdfValueTypeNames->Color3fArray,
-                PXR_NS::VtValue(mesh->colors[0])
+                PXR_NS::VtValue(colorData.first)
             );
             usdLayer->SetField(colorAttrSpec->GetPath(), PXR_NS::UsdGeomTokens->interpolation, PXR_NS::VtValue(PXR_NS::UsdGeomTokens->faceVarying));
+            CreateAndSetAttrSpec(
+                usdMeshSpec,
+                PXR_NS::TfToken(colorAttrSpec->GetName() + ":indices"),
+                PXR_NS::SdfValueTypeNames->IntArray,
+                PXR_NS::VtValue(colorData.second)
+            );
         }
 
         // Normals
-        if (!mesh->normals.empty())
+        PXR_NS::VtArray<PXR_NS::GfVec3f> validNormals;
+        if (GetValidMeshNormals(*mesh, mesh->points, mesh->normals, &validNormals))
         {
             auto normalsAttrSpec = CreateAndSetAttrSpec(
                 usdMeshSpec,
                 PXR_NS::UsdGeomTokens->normals,
                 PXR_NS::SdfValueTypeNames->Normal3fArray,
-                PXR_NS::VtValue(mesh->normals)
+                PXR_NS::VtValue(validNormals)
             );
             usdLayer->SetField(normalsAttrSpec->GetPath(), PXR_NS::UsdGeomTokens->interpolation, PXR_NS::VtValue(PXR_NS::UsdGeomTokens->faceVarying));
+
+            const bool hasNormalCache = mesh->normalCacheTimesamples.size() == mesh->pointCacheTimesamples.size();
+            for (size_t i = 0; i < mesh->pointCacheTimesamples.size(); ++i)
+            {
+                const auto& sampleNormals = hasNormalCache ? mesh->normalCacheTimesamples[i] : mesh->normals;
+                if (GetValidMeshNormals(*mesh, mesh->pointCacheTimesamples[i], sampleNormals, &validNormals))
+                {
+                    usdLayer->SetTimeSample(normalsAttrSpec->GetPath(), static_cast<double>(i / stage->mutiplier), PXR_NS::VtValue(validNormals));
+                }
+            }
         }
 
         // Texture UV
         for (size_t i = 0; i < mesh->uvs.size(); i++)
         {
+            if (mesh->uvs[i].empty())
+            {
+                continue;
+            }
+
             PXR_NS::TfToken stName;
             if (i == 0)
             {
@@ -2002,41 +2533,51 @@ PXR_NS::SdfPrimSpecHandle UsdExporter::ExportMeshInternal(
                 stName = PXR_NS::TfToken("st_" + std::to_string(i));
             }
 
+            auto uvData = DeduplicatePrimvarValues<2>(mesh->uvs[i]);
+            PXR_NS::VtIntArray uvIndices = uvData.second;
+            const bool hasFaceVaryingUvIndices = mesh->uvIndices.size() > i && mesh->uvIndices[i].size() == mesh->faceVertexIndices.size();
+            const bool isFaceVarying = mesh->uvs[i].size() == mesh->faceVertexIndices.size() || hasFaceVaryingUvIndices;
+            if (hasFaceVaryingUvIndices)
+            {
+                PXR_NS::VtIntArray remappedIndices;
+                remappedIndices.reserve(mesh->uvIndices[i].size());
+                bool validIndices = true;
+                for (const int sourceIndex : mesh->uvIndices[i])
+                {
+                    if (sourceIndex < 0 || static_cast<size_t>(sourceIndex) >= uvData.second.size())
+                    {
+                        validIndices = false;
+                        break;
+                    }
+                    remappedIndices.push_back(uvData.second[sourceIndex]);
+                }
+                if (validIndices)
+                {
+                    uvIndices = std::move(remappedIndices);
+                }
+            }
+
             auto uvAttrSpec = CreateAndSetAttrSpec(
                 usdMeshSpec,
                 PXR_NS::TfToken("primvars:" + stName.GetString()),
                 PXR_NS::SdfValueTypeNames->TexCoord2fArray,
-                PXR_NS::VtValue(mesh->uvs[i])
+                PXR_NS::VtValue(uvData.first)
             );
-            usdLayer->SetField(uvAttrSpec->GetPath(), PXR_NS::UsdGeomTokens->interpolation, PXR_NS::VtValue(PXR_NS::UsdGeomTokens->faceVarying));
-
-            if (mesh->uvIndices.size() > i)
-            {
-                if (mesh->faceVertexIndices.size() > 0)
-                {
-                    if (mesh->uvIndices[i].size() == mesh->faceVertexIndices.size())
-                    {
-                        PXR_NS::TfToken indicesAttrName(uvAttrSpec->GetName() + ":indices");
-                        auto indicesAttrSpec = CreateAndSetAttrSpec(
-                            usdMeshSpec,
-                            indicesAttrName,
-                            PXR_NS::SdfValueTypeNames->IntArray,
-                            PXR_NS::VtValue(mesh->uvIndices[i])
-                        );
-                    }
-                }
-            }
+            usdLayer->SetField(
+                uvAttrSpec->GetPath(),
+                PXR_NS::UsdGeomTokens->interpolation,
+                PXR_NS::VtValue(isFaceVarying ? PXR_NS::UsdGeomTokens->faceVarying : PXR_NS::UsdGeomTokens->vertex)
+            );
+            CreateAndSetAttrSpec(
+                usdMeshSpec,
+                PXR_NS::TfToken(uvAttrSpec->GetName() + ":indices"),
+                PXR_NS::SdfValueTypeNames->IntArray,
+                PXR_NS::VtValue(uvIndices)
+            );
         }
 
         meshPrimInfo.layerPath = usdLayer->GetIdentifier();
         meshPrimInfo.meshPrimPath = meshPath;
-        auto subdivisionAttrSpec = CreateAndSetAttrSpec(
-            usdMeshSpec,
-            PXR_NS::UsdGeomTokens->subdivisionScheme,
-            PXR_NS::SdfValueTypeNames->Token,
-            PXR_NS::VtValue(PXR_NS::UsdGeomTokens->none),
-            PXR_NS::SdfVariabilityUniform
-        );
     }
 
     if (mesh->meshSubsets.size() > 1)

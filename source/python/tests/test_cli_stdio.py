@@ -32,16 +32,85 @@ class TestCliFormatValidation(unittest.TestCase):
         self.assertIn("unsupported input format '.7z'", stderr.getvalue())
         self.assertIn(".fbx, .obj, .gltf, .glb, .stl, .ply", stderr.getvalue())
 
-    def test_main_rejects_usdz_output_before_loading_native_bindings(self) -> None:
+    def test_main_accepts_usdz_output_and_packages_via_usdz_helpers(self) -> None:
+        ok_status = types.SimpleNamespace(name="OK")
+        cancelled_status = types.SimpleNamespace(name="CANCELLED")
+        captured: dict[str, str] = {}
+
+        class _FakeOmniAssetConverter:
+            def __init__(self, input_path, output_path, **kwargs) -> None:
+                captured["layer_output"] = output_path
+                Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(output_path).write_text("# staging layer\n", encoding="utf-8")
+                self._status = ok_status
+
+            def get_status(self):
+                return self._status
+
+            def get_detailed_error(self) -> str:
+                return ""
+
+            def cancel(self) -> None:
+                self._status = cancelled_status
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> bool:
+                return False
+
+            @staticmethod
+            def set_log_callback(callback) -> None:
+                return None
+
+            @staticmethod
+            def shutdown() -> None:
+                return None
+
+        fake_module = types.ModuleType("asset_converter_native_bindings")
+        fake_module.OmniAssetConverter = _FakeOmniAssetConverter
+        fake_module.OmniConverterStatus = types.SimpleNamespace(OK=ok_status, CANCELLED=cancelled_status)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "scene.obj"
+            input_path.write_text("# stub\n", encoding="utf-8")
+            output_path = Path(temp_dir) / "scene.usdz"
+
+            def _fake_package(layer_path: Path, usdz_path: Path) -> None:
+                captured["package_layer"] = str(layer_path)
+                captured["package_usdz"] = str(usdz_path)
+                usdz_path.write_bytes(b"PK\x03\x04fake-usdz")
+
+            with mock.patch.dict(sys.modules, {"asset_converter_native_bindings": fake_module}):
+                with mock.patch.object(cli.usdz, "package_usdz", side_effect=_fake_package):
+                    with mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", stderr):
+                        exit_code = cli.main(["-i", str(input_path), "-o", str(output_path)])
+
+            self.assertEqual(exit_code, 0)
+            self.assertIn("Successfully converted:", stdout.getvalue())
+            self.assertTrue(output_path.is_file())
+            self.assertEqual(Path(captured["package_usdz"]), output_path)
+            self.assertEqual(Path(captured["package_layer"]).name, "scene.usdc")
+            self.assertTrue(Path(captured["layer_output"]).name.endswith(".usdc"))
+            self.assertFalse(list(output_path.parent.glob(".scene.usdz.staging-*")))
+
+    def test_validate_formats_accepts_fbx_on_linux(self) -> None:
+        with mock.patch.object(sys, "platform", "linux"):
+            args = cli._parse_args(["-i", "scene.fbx", "-o", "scene.usda"])
+            self.assertTrue(cli._validate_formats(args))
+
+    def test_main_rejects_unsupported_output_before_loading_native_bindings(self) -> None:
         stderr = io.StringIO()
 
         with mock.patch.dict(sys.modules, {"asset_converter_native_bindings": None}):
             with mock.patch.object(sys, "stderr", stderr):
-                exit_code = cli.main(["-i", "scene.obj", "-o", "scene.usdz"])
+                exit_code = cli.main(["-i", "scene.obj", "-o", "scene.obj"])
 
         self.assertEqual(exit_code, 1)
-        self.assertIn("unsupported output format '.usdz'", stderr.getvalue())
-        self.assertIn(".usd, .usda, .usdc", stderr.getvalue())
+        self.assertIn("unsupported output format '.obj'", stderr.getvalue())
+        self.assertIn(".usd, .usda, .usdc, .usdz", stderr.getvalue())
 
     def test_main_rejects_paths_without_extensions(self) -> None:
         stderr = io.StringIO()

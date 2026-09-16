@@ -9,6 +9,8 @@
 #include "../../utils/name_utils.h"
 #include "../exporter.h"
 
+#include <unordered_set>
+
 class UsdExporter : public Exporter
 {
 public:
@@ -23,19 +25,37 @@ public:
 
 private:
 
+    enum class MeshExportResult
+    {
+        Mesh,
+        PointCloud,
+        Skip,
+        Error
+    };
+
     OmniConverterStatus WriteLayerTo(PXR_NS::SdfLayerRefPtr layer, const std::string& path, std::string& detailedError);
     PXR_NS::SdfLayerRefPtr GetOrCreateLayer(const std::string& realStagePath, bool yAxis = true, double unit = 0.01);
     OmniConverterStatus UploadTextureIfNotEmpty(const TextureImagePtr& texture, std::string& detailedError);
     OmniConverterStatus UploadFileInternal(const std::string& filePath, const std::string& targetDir, std::string& detailedError);
+    std::string ReserveUniqueUploadPath(const std::string& targetPath);
 
     void PreprocessStage(const StagePtr& stage);
+    MeshExportResult PrepareMeshForExport(
+        const StagePtr& stage,
+        const MeshPtr& mesh,
+        const std::string& meshDisplayName,
+        OmniConverterStatus& status,
+        std::string& detailedError
+    );
     PXR_NS::SdfPrimSpecHandle BindOrDefineMesh(
         const StagePtr& stage,
         const MeshPtr& mesh,
         PXR_NS::SdfLayerRefPtr usdLayer,
         const PXR_NS::SdfPath& parentPath,
-        bool instanceable = false,
-        const std::string& instanceDisplayName = std::string()
+        bool instanceable,
+        const std::string& instanceDisplayName,
+        OmniConverterStatus& status,
+        std::string& detailedError
     );
     OmniConverterStatus ExportTextures(const StagePtr& stage, std::string& detailedError);
     OmniConverterStatus ExportInstancedMeshes(const StagePtr& stage, std::string& detailedError);
@@ -46,13 +66,16 @@ private:
         const StageNodePtr& stageNode,
         PXR_NS::SdfLayerRefPtr usdLayer,
         const PXR_NS::SdfPath& parentPrimPath,
-        NameUtils::NameCache& uniqueNameCount
+        NameUtils::NameCache& uniqueNameCount,
+        std::string& detailedError
     );
     PXR_NS::SdfPrimSpecHandle ExportSkeletonAndSkinning(
         const StagePtr& stage,
         const StageNodePtr& rootBone,
         PXR_NS::SdfLayerRefPtr usdLayer,
-        const PXR_NS::SdfPath& skeletonRootPath
+        const PXR_NS::SdfPath& skeletonRootPath,
+        OmniConverterStatus& status,
+        std::string& detailedError
     );
 
     PXR_NS::SdfPrimSpecHandle ExportMeshInternal(
@@ -60,7 +83,9 @@ private:
         const StagePtr& stage,
         const MeshPtr& mesh,
         const PXR_NS::SdfPath& meshPath,
-        const std::string& meshDisplayName = std::string()
+        const std::string& meshDisplayName,
+        OmniConverterStatus& status,
+        std::string& detailedError
     );
 
     PXR_NS::SdfPrimSpecHandle ExportPointCloud(
@@ -69,6 +94,18 @@ private:
         const MeshPtr& pointCloud,
         const PXR_NS::SdfPath& pointCloudPath,
         const std::string& pointCloudDisplayName
+    );
+    PXR_NS::SdfPrimSpecHandle ExportCurve(
+        PXR_NS::SdfLayerRefPtr usdLayer,
+        const CurvePtr& curve,
+        const PXR_NS::SdfPath& curvePath,
+        const std::string& curveDisplayName
+    );
+    PXR_NS::SdfPrimSpecHandle ExportNurbsCurve(
+        PXR_NS::SdfLayerRefPtr usdLayer,
+        const CurvePtr& curve,
+        const PXR_NS::SdfPath& curvePath,
+        const std::string& curveDisplayName
     );
     OmniConverterStatus ExportAnimations(const StagePtr& stage, std::string& detailedError);
     void ExportPreviewSurfaceNode(
@@ -135,6 +172,7 @@ private:
                                            // will point to the prototype mesh.
         std::vector<PXR_NS::SdfPath> subsets; // It's not empty if it has more than one subsets.
         size_t meshInstanceCount = 0; // Instances count in scene graph.
+        bool meshCompactionComplete = false;
     };
 
     struct StageNodeInfo
@@ -152,12 +190,14 @@ private:
     std::vector<bool> mShouldExportMaterial;
     std::unordered_map<MeshPtr, MeshPrimInfo> mMeshPrimInfos;
     std::unordered_map<StageNodePtr, StageNodeInfo> mStageNodeInfos;
+    std::unordered_set<size_t> mExportedCurveIndices;
 
     std::unordered_map<TextureImagePtr, std::string> mTextureUploadPath;
     // Hold in-memory layers until exit to avoid it's been released before reference
     // Key will be identifier of in-memory layer.
     std::unordered_map<std::string, PXR_NS::SdfLayerRefPtr> mLayerHolders;
     std::unordered_map<std::string, std::string> mUploadedFiles;
+    std::unordered_set<std::string> mUploadedTargetPaths;
 
     NameUtils::NameCache mUniqueMaterialName;
     std::unordered_map<MaterialPtr, NameInfo> mMaterialNameInfos;

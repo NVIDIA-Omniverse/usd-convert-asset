@@ -202,18 +202,27 @@ void OmniConverterFuture::Convert(std::shared_ptr<OmniConverterFuture::FutureThr
                 StageUtils::MergeMeshes(importedStage, "mesh");
             }
 
+            if (!StageUtils::CleanupMeshes(importedStage, detailedError))
+            {
+                context->converterContext.Log("ERROR: " + detailedError);
+                status = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
+            }
+
             // Creates root node always
             if (!importedStage->rootNode)
             {
                 importedStage->rootNode = std::make_shared<StageNode>("Root");
             }
 
-            auto exporter = CreateExporter(context);
-            auto startExportTime = std::chrono::system_clock::now();
-            status = exporter->Export(importedStage, detailedError);
-            auto endExportTime = std::chrono::system_clock::now();
-            auto exportCost = std::chrono::duration_cast<std::chrono::seconds>(endExportTime - startExportTime).count();
-            context->converterContext.Log("Costs " + std::to_string(exportCost) + "s for exporter to export asset.");
+            if (status == OmniConverterStatus::OK)
+            {
+                auto exporter = CreateExporter(context);
+                auto startExportTime = std::chrono::system_clock::now();
+                status = exporter->Export(importedStage, detailedError);
+                auto endExportTime = std::chrono::system_clock::now();
+                auto exportCost = std::chrono::duration_cast<std::chrono::seconds>(endExportTime - startExportTime).count();
+                context->converterContext.Log("Costs " + std::to_string(exportCost) + "s for exporter to export asset.");
+            }
         }
     }
 

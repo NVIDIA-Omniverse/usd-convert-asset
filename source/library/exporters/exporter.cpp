@@ -22,7 +22,7 @@ bool Exporter::UploadContent(const std::string& path, OmniConverterBlob* blob)
     return mExportContext->converterContext.WriteBinary(path, blob);
 }
 
-size_t Exporter::GetTotalExportSteps(const StagePtr& stage) const
+size_t Exporter::GetTotalExportSteps(const StagePtr& stage, bool includeCurves) const
 {
     size_t numEmbededTextures = 0;
     for (size_t i = 0; i < stage->materials.size(); i++)
@@ -45,13 +45,13 @@ size_t Exporter::GetTotalExportSteps(const StagePtr& stage) const
     }
 
 
-    uint32_t numMesheSteps = stage->meshes.size();
+    uint32_t numGeometrySteps = stage->meshes.size() + (includeCurves ? stage->curves.size() : 0);
     uint32_t numMaterialSteps = mExportContext->converterContext.IgnoreMaterials() ? 0 :
                                                                                      stage->materials.size() +
                                                                                          numEmbededTextures
         ;
     uint32_t numAnimationSteps = mExportContext->converterContext.IgnoreAnimations() ? 0 : stage->animationTracks.size();
-    uint32_t totalSteps = numMesheSteps + numMaterialSteps + numAnimationSteps + 1;
+    uint32_t totalSteps = numGeometrySteps + numMaterialSteps + numAnimationSteps + 1;
 
     return totalSteps;
 }
