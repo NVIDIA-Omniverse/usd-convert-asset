@@ -19,6 +19,27 @@ _CJK_PATH = r"out dir éñ/cube 你好.usda"
 _CJK_PATH_MESSAGE = f"Successfully converted: {_CJK_PATH}"
 
 
+class TestCliDeprecation(unittest.TestCase):
+
+    def test_single_mesh_names_replacement_on_stderr(self) -> None:
+        stderr = io.StringIO()
+
+        with mock.patch.object(sys, "stderr", stderr):
+            args = cli._parse_args(["-i", "scene.obj", "-o", "scene.usda", "--single-mesh"])
+
+        self.assertTrue(args.single_props_file)
+        self.assertEqual(stderr.getvalue(), "--single-mesh is deprecated; use --single-props-file.\n")
+
+    def test_single_props_file_does_not_emit_deprecation_note(self) -> None:
+        stderr = io.StringIO()
+
+        with mock.patch.object(sys, "stderr", stderr):
+            args = cli._parse_args(["-i", "scene.obj", "-o", "scene.usda", "--single-props-file"])
+
+        self.assertTrue(args.single_props_file)
+        self.assertEqual(stderr.getvalue(), "")
+
+
 class TestCliFormatValidation(unittest.TestCase):
 
     def test_main_rejects_unsupported_input_before_loading_native_bindings(self) -> None:
@@ -35,11 +56,15 @@ class TestCliFormatValidation(unittest.TestCase):
     def test_main_accepts_usdz_output_and_packages_via_usdz_helpers(self) -> None:
         ok_status = types.SimpleNamespace(name="OK")
         cancelled_status = types.SimpleNamespace(name="CANCELLED")
-        captured: dict[str, str] = {}
+        captured: dict[str, object] = {}
 
         class _FakeOmniAssetConverter:
             def __init__(self, input_path, output_path, **kwargs) -> None:
                 captured["layer_output"] = output_path
+                captured["convert_fbx_to_y_up"] = kwargs["convert_fbx_to_y_up"]
+                captured["convert_fbx_to_z_up"] = kwargs["convert_fbx_to_z_up"]
+                captured["convert_stage_up_y"] = kwargs["convert_stage_up_y"]
+                captured["convert_stage_up_z"] = kwargs["convert_stage_up_z"]
                 Path(output_path).parent.mkdir(parents=True, exist_ok=True)
                 Path(output_path).write_text("# staging layer\n", encoding="utf-8")
                 self._status = ok_status
@@ -54,6 +79,8 @@ class TestCliFormatValidation(unittest.TestCase):
                 self._status = cancelled_status
 
             async def __aenter__(self):
+                if hasattr(self, "_destination"):
+                    self._destination.write_text("#usda 1.0")
                 return self
 
             async def __aexit__(self, exc_type, exc, tb) -> bool:
@@ -86,12 +113,25 @@ class TestCliFormatValidation(unittest.TestCase):
             with mock.patch.dict(sys.modules, {"asset_converter_native_bindings": fake_module}):
                 with mock.patch.object(cli.usdz, "package_usdz", side_effect=_fake_package):
                     with mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", stderr):
-                        exit_code = cli.main(["-i", str(input_path), "-o", str(output_path)])
+                        exit_code = cli.main(
+                            [
+                                "-i",
+                                str(input_path),
+                                "-o",
+                                str(output_path),
+                                "--fbx-z-up",
+                                "--stage-up-y",
+                            ]
+                        )
 
             self.assertEqual(exit_code, 0)
             self.assertIn("Successfully converted:", stdout.getvalue())
+            self.assertIs(captured["convert_fbx_to_y_up"], False)
+            self.assertIs(captured["convert_fbx_to_z_up"], True)
+            self.assertIs(captured["convert_stage_up_y"], True)
+            self.assertIs(captured["convert_stage_up_z"], False)
             self.assertTrue(output_path.is_file())
-            self.assertEqual(Path(captured["package_usdz"]), output_path)
+            self.assertEqual(Path(captured["package_usdz"]), Path(captured["package_layer"]).parent / output_path.name)
             self.assertEqual(Path(captured["package_layer"]).name, "scene.usdc")
             self.assertTrue(Path(captured["layer_output"]).name.endswith(".usdc"))
             self.assertFalse(list(output_path.parent.glob(".scene.usdz.staging-*")))
@@ -164,6 +204,7 @@ class TestCliGaussianSplatPly(unittest.TestCase):
         class _FakeOmniAssetConverter:
             def __init__(self, *args, **kwargs) -> None:
                 self._status = ok_status
+                self._destination = Path(args[1])
 
             def get_status(self):
                 return self._status
@@ -175,6 +216,8 @@ class TestCliGaussianSplatPly(unittest.TestCase):
                 self._status = cancelled_status
 
             async def __aenter__(self):
+                if hasattr(self, "_destination"):
+                    self._destination.write_text("#usda 1.0")
                 return self
 
             async def __aexit__(self, exc_type, exc, tb) -> bool:
@@ -227,6 +270,34 @@ class TestCliGaussianSplatPly(unittest.TestCase):
 
 class TestCliStdio(unittest.TestCase):
 
+    def test_debug_faulthandler_falls_back_from_stderr_without_fileno(self) -> None:
+        args = types.SimpleNamespace(debug=True)
+        stderr = io.StringIO()
+
+        with mock.patch.object(sys, "stderr", stderr):
+            with mock.patch.object(
+                cli.faulthandler,
+                "enable",
+                side_effect=[io.UnsupportedOperation("fileno"), None],
+            ) as enable:
+                cli._enable_faulthandler(args)
+
+        self.assertEqual(
+            enable.call_args_list,
+            [mock.call(file=stderr), mock.call(file=sys.__stderr__)],
+        )
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_debug_continues_when_faulthandler_is_unavailable(self) -> None:
+        args = types.SimpleNamespace(debug=True)
+        stderr = io.StringIO()
+
+        with mock.patch.object(sys, "stderr", stderr):
+            with mock.patch.object(cli.faulthandler, "enable", side_effect=io.UnsupportedOperation("fileno")):
+                cli._enable_faulthandler(args)
+
+        self.assertEqual(stderr.getvalue(), "Debug: faulthandler unavailable for current stderr\n")
+
     def test_main_returns_zero_when_success_print_has_non_ascii_path(self) -> None:
         ok_status = types.SimpleNamespace(name="OK")
         cancelled_status = types.SimpleNamespace(name="CANCELLED")
@@ -234,6 +305,7 @@ class TestCliStdio(unittest.TestCase):
         class _FakeOmniAssetConverter:
             def __init__(self, *args, **kwargs) -> None:
                 self._status = ok_status
+                self._destination = Path(args[1])
 
             def get_status(self):
                 return self._status
@@ -245,6 +317,8 @@ class TestCliStdio(unittest.TestCase):
                 self._status = cancelled_status
 
             async def __aenter__(self):
+                if hasattr(self, "_destination"):
+                    self._destination.write_text("#usda 1.0")
                 return self
 
             async def __aexit__(self, exc_type, exc, tb) -> bool:

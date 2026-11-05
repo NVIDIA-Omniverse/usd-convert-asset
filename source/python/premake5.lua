@@ -23,8 +23,4 @@ project "usd_convert_asset[pip]"
         { "PACKAGE-LICENSES", pip_package_dir.."/PACKAGE-LICENSES" },
     }
 
-    if os.target() == "linux" then
-        table.insert(staged_files, { target_deps.."/python/lib/libpython*${lib_ext}*", pip_package_dir.."/asset_converter_native_bindings/libs" })
-    end
-
     repo_build.prebuild_copy(staged_files)

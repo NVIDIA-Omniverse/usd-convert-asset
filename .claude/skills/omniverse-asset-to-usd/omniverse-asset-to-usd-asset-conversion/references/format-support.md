@@ -11,8 +11,8 @@ Use this reference when validating source and destination extensions or explaini
 |--------|-------|
 | `.fbx` | Imported with Autodesk FBX SDK on Windows x86_64 and Linux x86_64, and with Assimp on Linux aarch64. FBX SDK builds support optional Y-up/Z-up conversion, pivot handling, scale baking, rotation filtering, bone filtering, and preservation of valid static NURBS curves as `UsdGeomNurbsCurves`. Animated control-point deformation is not supported. |
 | `.obj` | Mesh conversion with material, normal, mesh merge, and stage up-axis controls. |
-| `.gltf` | Text glTF conversion with optional embedded data export and flavor-sensitive MDL extension support. |
-| `.glb` | Binary glTF conversion with optional embedded data export and flavor-sensitive MDL extension support. |
+| `.gltf` | Text glTF conversion with optional embedded data export. |
+| `.glb` | Binary glTF conversion with optional embedded data export. |
 | `.stl` | Assimp-backed triangle mesh import; case-insensitive extension handling is covered by tests. |
 | `.ply` | Assimp-backed mesh and point-cloud import, including vertex colors and optional normals. |
 

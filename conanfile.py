@@ -10,7 +10,6 @@ class UsdConvertAssetDependencies(ConanFile):
 
     requires = (
         "assimp/6.0.2",
-        "libxml2/2.14.5",
         "draco/1.5.6",
         "tinyxml2/11.0.0",
         "doctest/2.4.12",
@@ -20,6 +19,11 @@ class UsdConvertAssetDependencies(ConanFile):
     )
 
     def requirements(self):
+        if self.settings.os == "Linux":
+            self.requires("libxml2/2.13.8")
+        elif self.settings.os == "Windows":
+            self.requires("libxml2/2.15.4")
+
         self.requires("stb/cci.20240531", override=True)
 
     default_options = {

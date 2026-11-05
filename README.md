@@ -56,6 +56,9 @@ Replace `<platform>` with the build platform:
 - Linux aarch64: `linux-aarch64`
 
 The Linux aarch64 build converts FBX through Assimp rather than Autodesk FBX SDK.
+This fallback does not provide the same fidelity as the Autodesk path. In particular,
+FBX skin bindings and lights are not preserved on import, and animation and skin
+bindings are not preserved on export. Validate these workflows on the target platform.
 
 More Python package details live in `source/python/README.md`.
 
@@ -144,6 +147,10 @@ Common conversion options include `--single-props-file`, `--ignore-materials`,
 `--ignore-animation`, `--fbx-y-up`, `--fbx-z-up`, `--stage-up-y`, and
 `--stage-up-z`.
 
+`--single-props-file` stores mesh data in the exported scene and disables USD
+scene instancing. It does not merge meshes. It also places copied texture
+sidecars under `materials/textures/` instead of `textures/`.
+
 Common examples:
 
 ```bash
@@ -162,7 +169,14 @@ for asset in assets/*.fbx; do
 done
 ```
 
-USDZ output enables USD Preview Surface automatically when materials are exported.
+When materials are exported, the converter authors USD Preview Surface materials for all supported USD output formats.
+This changes the default material model from the MDL output used in 1.1. Full MDL
+shader evaluation and glTF MDL extensions are no longer supported. Any available
+base-color fallback is only an approximation; textures and more complex MDL
+behavior may not survive conversion. For predictable results, supply a USD
+Preview Surface material alongside MDL.
+
+UsdPreviewSurface inputs use the types defined by the UsdPreviewSurface specification: `color3f` for color inputs and `normal3f` for the normal. Scripts that create or compare texture-connected inputs previously typed as `float3` must use these types; the values are unchanged.
 Use `--ignore-materials` to create a geometry-only USDZ package.
 
 - More examples/tutorials: `source/python/README.md`

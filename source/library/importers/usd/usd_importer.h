@@ -4,6 +4,8 @@
 #pragma once
 
 #include "../../pxr_includes.h"
+
+#include <unordered_set>
 #include "../importer.h"
 
 class UsdSdkImporter : public Importer
@@ -23,6 +25,7 @@ private:
     MaterialPtr PopulateOmniGlassMaterial(const StagePtr& stage, const PXR_NS::UsdShadeShader& usdShader);
     MaterialPtr PopulateUsdPreviewSurfaceMaterial(const StagePtr& stage, const PXR_NS::UsdShadeShader& usdShader);
     MaterialPtr PopulateGltfMaterial(const StagePtr& stage, const PXR_NS::UsdShadeShader& usdShader);
+    bool GetMdlFallbackDiffuseColor(const PXR_NS::UsdShadeShader& usdShader, PXR_NS::GfVec3f& diffuseColor);
 #if PXR_MINOR_VERSION > 21 || (PXR_MINOR_VERSION == 21 && PXR_PATCH_VERSION >= 11)
     LightPtr PopulateLight(const PXR_NS::UsdLuxLightAPI& usdLight);
 #else
@@ -55,8 +58,10 @@ private:
     };
 
     OmniFutureThreadContextPtr mThreadContext;
+    std::string mSkeletonError;
     std::unordered_map<PXR_NS::SdfPath, size_t, PXR_NS::SdfPath::Hash> mDefinedMaterials;
     std::unordered_map<PXR_NS::SdfPath, size_t, PXR_NS::SdfPath::Hash> mDefinedMeshes;
+    std::unordered_set<PXR_NS::SdfPath, PXR_NS::SdfPath::Hash> mSkinnedMeshPaths;
     std::unordered_map<std::string, size_t> mTextureIndex;
     std::vector<PXR_NS::SdfPath> mCameraPrimPaths;
     std::vector<AnimationTrack> mAllAnimationTracks;

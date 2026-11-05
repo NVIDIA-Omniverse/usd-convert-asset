@@ -38,7 +38,7 @@
 // USD files for instancing assets.
 #define OMNI_CONVERTER_FLAGS_SINGLE_MESH_FILE (0x1 << 2)
 
-// Generate Smooth Normals for mesh.
+// Generate smooth normals for meshes without authored normals. Authored normals take precedence.
 #define OMNI_CONVERTER_FLAGS_GEN_SMOOTH_NORMALS (0x1 << 3)
 
 // Don't export camera from asset
@@ -302,10 +302,28 @@ OMNI_ASSET_CONVERTER_EXPORT OmniConverterStatus omniConverterCheckFutureStatus(O
 OMNI_ASSET_CONVERTER_EXPORT const char* omniConverterGetFutureDetailedError(OmniConverterFuture* future);
 
 /**
+ * Records an error raised by a callback for the specified future.
+ */
+OMNI_ASSET_CONVERTER_EXPORT void omniConverterSetFutureCallbackError(OmniConverterFuture* future, const char* error);
+
+/**
+ * Copies the temporary output directory for an in-memory conversion.
+ * Returns the required buffer size, including the null terminator.
+ * The caller must remove the returned directory after its referenced layer no longer needs it.
+ */
+OMNI_ASSET_CONVERTER_EXPORT size_t omniConverterGetFutureTemporaryOutputDirectory(OmniConverterFuture* future, char* path, size_t pathSize);
+
+/**
  * Cancels future. Only when future is in progress, it's cancellable. omniConverterCheckFutureStatus will return
  * CANCELLED.
  */
 OMNI_ASSET_CONVERTER_EXPORT void omniConverterCancelFuture(OmniConverterFuture* future);
+
+/**
+ * Releases a future. This call blocks until its worker thread exits.
+ * If a converter callback releases its own future, this call returns immediately to avoid a deadlock.
+ * Future destruction then occurs after the callback returns and the worker exits.
+ */
 OMNI_ASSET_CONVERTER_EXPORT void omniConverterReleaseFuture(OmniConverterFuture* future);
 
 

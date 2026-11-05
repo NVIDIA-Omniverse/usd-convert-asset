@@ -7,9 +7,12 @@
 #include "../../utils/utils.h"
 #include "usd_type_traits.h"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <numeric>
 #include <queue>
+#include <regex>
 
 using namespace omni::assetconverter::importer::usd;
 
@@ -220,19 +223,28 @@ static bool GetValueFromOp(PXR_NS::UsdGeomXformOp op, ValueType& value, PXR_NS::
     {
         typename Traits::HalfType halfValue;
         success = op.GetAs<typename Traits::HalfType>(&halfValue, timeCode);
-        value = ValueType(halfValue);
+        if (success)
+        {
+            value = ValueType(halfValue);
+        }
     }
     else if (op.GetPrecision() == PXR_NS::UsdGeomXformOp::PrecisionDouble)
     {
         typename Traits::DoubleType doubleType;
         success = op.GetAs<typename Traits::DoubleType>(&doubleType, timeCode);
-        value = ValueType(doubleType);
+        if (success)
+        {
+            value = ValueType(doubleType);
+        }
     }
     else
     {
         typename Traits::FloatType floatType;
         success = op.GetAs<typename Traits::FloatType>(&floatType, timeCode);
-        value = ValueType(floatType);
+        if (success)
+        {
+            value = ValueType(floatType);
+        }
     }
 
     return success;
@@ -280,10 +292,11 @@ PXR_NS::GfVec3d ConvertToXYZ(const PXR_NS::UsdGeomXformOp& op, double timeCode)
                 break;
         }
 
-        double scalar;
-        op.GetAs<double>(&scalar, timeCode);
-
-        result[scalarDestIndex] = scalar;
+        double scalar = 0.0;
+        if (op.GetAs<double>(&scalar, timeCode))
+        {
+            result[scalarDestIndex] = scalar;
+        }
     }
     else
     {
@@ -310,7 +323,7 @@ PXR_NS::GfVec3d ConvertToXYZ(const PXR_NS::UsdGeomXformOp& op, double timeCode)
                 break;
         }
 
-        PXR_NS::GfVec3d value;
+        PXR_NS::GfVec3d value(0.0);
         GetValueFromOp<PXR_NS::GfVec3d>(op, value, timeCode);
 
         for (uint32_t i = 0; i < swizzle.size(); i++)
@@ -322,7 +335,27 @@ PXR_NS::GfVec3d ConvertToXYZ(const PXR_NS::UsdGeomXformOp& op, double timeCode)
     return result;
 }
 
-static PXR_NS::VtArray<PXR_NS::GfVec3d> GetRotationOpTimesamples(const PXR_NS::UsdGeomXformable& xform, double startTime, double endTime)
+// Include the exact endpoint when it falls between regular one-tick samples.
+template <typename Evaluate>
+static void SampleAnimationTimes(double startTime, double endTime, Evaluate evaluate)
+{
+    const double duration = endTime - startTime;
+    for (double offset = 0.0; offset < duration; offset += 1.0)
+    {
+        evaluate(startTime + offset);
+    }
+    if (duration >= 0.0)
+    {
+        evaluate(endTime);
+    }
+}
+
+static PXR_NS::VtArray<PXR_NS::GfVec3d> GetRotationOpTimesamples(
+    const PXR_NS::UsdGeomXformable& xform,
+    double startTime,
+    double endTime,
+    double& sampleEndTime
+)
 {
     PXR_NS::VtArray<PXR_NS::GfVec3d> sampleValues;
     bool resetXformStack = false;
@@ -341,10 +374,15 @@ static PXR_NS::VtArray<PXR_NS::GfVec3d> GetRotationOpTimesamples(const PXR_NS::U
 
             // need filler values from start time, but after end time no additional values needed.
             endTime = std::min(endTime, timeSamples.back());
-            for (double timeCode = startTime; timeCode <= endTime; timeCode += 1.0)
-            {
-                sampleValues.push_back(ConvertToXYZ(op, timeCode));
-            }
+            sampleEndTime = endTime - startTime;
+            SampleAnimationTimes(
+                startTime,
+                endTime,
+                [&](double timeCode)
+                {
+                    sampleValues.push_back(ConvertToXYZ(op, timeCode));
+                }
+            );
 
             return sampleValues;
         }
@@ -358,7 +396,8 @@ static PXR_NS::VtArray<ValueType> GetXformOpTimesamples(
     const PXR_NS::UsdGeomXformable& xform,
     PXR_NS::UsdGeomXformOp::Type opType,
     double startTime,
-    double endTime
+    double endTime,
+    double& sampleEndTime
 )
 {
     PXR_NS::VtArray<ValueType> sampleValues;
@@ -384,12 +423,19 @@ static PXR_NS::VtArray<ValueType> GetXformOpTimesamples(
 
             // need filler values from start time, but after end time no additional values needed.
             endTime = std::min(endTime, timeSamples.back());
-            for (double timeCode = startTime; timeCode <= endTime; timeCode += 1.0)
-            {
-                ValueType value;
-                GetValueFromOp<ValueType>(op, value, timeCode);
-                sampleValues.push_back(value);
-            }
+            sampleEndTime = endTime - startTime;
+            SampleAnimationTimes(
+                startTime,
+                endTime,
+                [&](double timeCode)
+                {
+                    const bool identity = opType == PXR_NS::UsdGeomXformOp::TypeScale || opType == PXR_NS::UsdGeomXformOp::TypeOrient ||
+                                          opType == PXR_NS::UsdGeomXformOp::TypeTransform;
+                    ValueType value(identity ? 1.0 : 0.0);
+                    GetValueFromOp<ValueType>(op, value, timeCode);
+                    sampleValues.push_back(value);
+                }
+            );
 
             return sampleValues;
         }
@@ -406,26 +452,32 @@ static TransformTimesamples GetTransformTimesamples(const PXR_NS::UsdGeomXformab
     PXR_NS::VtArray<PXR_NS::GfVec3d> scales;
 
     // need filler values from start time, but after end time no additional values needed.
-    for (double timeCode = startTime; timeCode <= endTime; timeCode += 1.0)
-    {
-        TranslateEulerScaleTransform trs;
-        PXR_NS::GfMatrix4d localMatrix(1.0);
-        xform.GetLocalTransformation(&localMatrix, &resetXformStack, timeCode);
+    SampleAnimationTimes(
+        startTime,
+        endTime,
+        [&](double timeCode)
+        {
+            TranslateEulerScaleTransform trs;
+            PXR_NS::GfMatrix4d localMatrix(1.0);
+            xform.GetLocalTransformation(&localMatrix, &resetXformStack, timeCode);
 
-        PXR_NS::GfMatrix4d rotMat(1.0);
-        PXR_NS::GfMatrix4d scaleOrientMatUnused, perspMatUnused;
-        PXR_NS::GfQuatd rotation;
-        localMatrix.Factor(&scaleOrientMatUnused, &trs.s, &rotMat, &trs.t, &perspMatUnused);
+            PXR_NS::GfMatrix4d rotMat(1.0);
+            PXR_NS::GfMatrix4d scaleOrientMatUnused, perspMatUnused;
+            PXR_NS::GfQuatd rotation;
+            localMatrix.Factor(&scaleOrientMatUnused, &trs.s, &rotMat, &trs.t, &perspMatUnused);
 
-        // By default decompose as XYZ order (make it an option?)
-        auto angles = rotMat.ExtractRotation().Decompose(PXR_NS::GfVec3d::ZAxis(), PXR_NS::GfVec3d::YAxis(), PXR_NS::GfVec3d::XAxis());
-        trs.r = { angles[2], angles[1], angles[0] };
-        translations.push_back(trs.t);
-        rotations.push_back(trs.r);
-        scales.push_back(trs.s);
-    }
+            // By default decompose as XYZ order (make it an option?)
+            auto angles = rotMat.ExtractRotation().Decompose(PXR_NS::GfVec3d::ZAxis(), PXR_NS::GfVec3d::YAxis(), PXR_NS::GfVec3d::XAxis());
+            trs.r = { angles[2], angles[1], angles[0] };
+            translations.push_back(trs.t);
+            rotations.push_back(trs.r);
+            scales.push_back(trs.s);
+        }
+    );
 
-    return TransformTimesamples(translations, rotations, scales);
+    TransformTimesamples samples(translations, rotations, scales);
+    samples.SetSampleEndTime(endTime - startTime);
+    return samples;
 }
 
 static Transform GetLocalTransform(
@@ -559,6 +611,7 @@ static Transform GetLocalTransform(
 StagePtr UsdSdkImporter::ImportStage(const OmniFutureThreadContextPtr& context, OmniConverterStatus& status, std::string& detailedError)
 {
     mThreadContext = context;
+    mSkeletonError.clear();
 
     mThreadContext->converterContext.Log("Starting to import asset with UsdImporter...");
     PXR_NS::UsdStageRefPtr usdStage = mThreadContext->converterContext.GetCachedStage();
@@ -642,7 +695,8 @@ StagePtr UsdSdkImporter::ImportStage(const OmniFutureThreadContextPtr& context, 
         }
         endTime = rootLayer->GetEndTimeCode();
         maxKeyFrames = (size_t)std::ceil(endTime - startTime) + 1;
-        fps = rootLayer->GetFramesPerSecond();
+        // Time codes determine elapsed seconds; display FPS may be different.
+        fps = usdStage->GetTimeCodesPerSecond();
         if (PXR_NS::GfIsClose(fps, 0.0, 1e-6))
         {
             fps = 24.0;
@@ -658,6 +712,7 @@ StagePtr UsdSdkImporter::ImportStage(const OmniFutureThreadContextPtr& context, 
         AnimationTrack animTrack;
         animTrack.fps = fps;
         animTrack.keyFrames = maxKeyFrames;
+        animTrack.duration = endTime - startTime;
 
         auto defaultPrim = allChildren.front();
         if (defaultPrim.HasVariantSets())
@@ -691,6 +746,14 @@ StagePtr UsdSdkImporter::ImportStage(const OmniFutureThreadContextPtr& context, 
     else if (rootPrimCount == 1)
     {
         TraverseUsdStage(allChildren.front(), stage, nullptr);
+    }
+
+    if (!mSkeletonError.empty())
+    {
+        detailedError = mSkeletonError;
+        mThreadContext->converterContext.Log(detailedError);
+        status = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
+        return nullptr;
     }
 
     auto customLayerData = usdStage->GetRootLayer()->GetCustomLayerData();
@@ -762,25 +825,18 @@ void UsdSdkImporter::TraverseUsdStage(const PXR_NS::UsdPrim& currentPrim, StageP
             transformAnimationTracks = GetTransformAnimation(currentPrim, stage, !PXR_NS::GfIsClose(localTransform.GetPivot(), ZERO_VEC_3D, 1e-6));
         }
 
-        // Skips children traverse as children other than skeleton related will be skipped.
+        // Import the rig, then traverse its other children so unbound meshes survive.
         if (currentPrim.IsA<PXR_NS::UsdSkelRoot>() && !mThreadContext->converterContext.PopulateMaterialsOnly())
         {
             auto rootBoneNode = ImportSkeleton(currentPrim, stage);
             if (rootBoneNode)
             {
-                if (!localTransform.IsIdentity() || !transformAnimationTracks.empty())
-                {
-                    node = std::make_shared<StageNode>(currentPrim.GetName());
-                    node->children.push_back(rootBoneNode);
-                    node->localTransform = localTransform;
-                    node->worldTransformMatrix = worldTransformMatrix;
-                    node->transformAnimationTracks = transformAnimationTracks;
-                }
-                else
-                {
-                    node = rootBoneNode;
-                }
-                skipTraverse = true;
+                node = std::make_shared<StageNode>(currentPrim.GetName());
+                node->children.push_back(rootBoneNode);
+                rootBoneNode->parent = node;
+                node->localTransform = localTransform;
+                node->worldTransformMatrix = worldTransformMatrix;
+                node->transformAnimationTracks = transformAnimationTracks;
             }
         }
 
@@ -808,7 +864,8 @@ void UsdSdkImporter::TraverseUsdStage(const PXR_NS::UsdPrim& currentPrim, StageP
                 skipTraverse = true;
             }
 
-            if (currentPrim.IsA<PXR_NS::UsdGeomMesh>() && !mThreadContext->converterContext.PopulateMaterialsOnly())
+            if (currentPrim.IsA<PXR_NS::UsdGeomMesh>() && !mThreadContext->converterContext.PopulateMaterialsOnly() &&
+                mSkinnedMeshPaths.count(currentPrim.GetPath()) == 0)
             {
                 PXR_NS::SdfPath meshPath;
                 if (currentPrim.IsInstanceProxy())
@@ -903,6 +960,7 @@ MeshPtr UsdSdkImporter::PopulateMesh(const StagePtr& stage, const PXR_NS::UsdGeo
 {
     MeshPtr mesh = std::make_shared<Mesh>();
     mesh->name = usdMesh.GetPrim().GetName();
+    usdMesh.GetDoubleSidedAttr().Get(&mesh->doubleSided);
 
     // Add triangles
     auto pointsAttr = usdMesh.GetPointsAttr();
@@ -1125,7 +1183,7 @@ MeshPtr UsdSdkImporter::PopulateMesh(const StagePtr& stage, const PXR_NS::UsdGeo
 
     // Add normal
     bool hasNormal = false;
-    if (const auto& normalAttr = usdMesh.GetNormalsAttr())
+    if (const auto& normalAttr = usdMesh.GetNormalsAttr(); normalAttr && normalAttr.HasAuthoredValue())
     {
         auto FlipNormalHandedness = [mesh](PXR_NS::VtArray<PXR_NS::GfVec3f>& normals)
         {
@@ -1212,8 +1270,9 @@ MeshPtr UsdSdkImporter::PopulateMesh(const StagePtr& stage, const PXR_NS::UsdGeo
 
     // Compute normal if necessary
     // Note this is a basic face / uniform normal, no smoothing is applied.
-    if (!hasNormal)
+    if (!hasNormal && !mThreadContext->converterContext.SmoothNormals())
     {
+        mesh->hasFaceVaryingNormals = true;
         mesh->normals.resize(mesh->faceVertexIndices.size());
         size_t totalVertices = 0;
         for (const auto& vertexCount : mesh->faceVertexCounts)
@@ -1400,8 +1459,85 @@ CameraPtr UsdSdkImporter::PopulateCamera(const PXR_NS::UsdGeomCamera& usdCamera)
     return camera;
 }
 
+bool UsdSdkImporter::GetMdlFallbackDiffuseColor(const PXR_NS::UsdShadeShader& usdShader, PXR_NS::GfVec3f& diffuseColor)
+{
+    // An authored parameter overrides the default in the MDL source file.
+    for (const char* name : { "diffuse_color_constant", "diffuse_reflection_color", "base_color", "tint" })
+    {
+        const auto input = usdShader.GetInput(PXR_NS::TfToken(name));
+        if (input && !input.HasConnectedSource() && input.Get(&diffuseColor))
+        {
+            return true;
+        }
+    }
+
+    PXR_NS::SdfAssetPath sourceAsset;
+    if (!usdShader.GetSourceAsset(&sourceAsset, PXR_NS::TfToken("mdl")))
+    {
+        return false;
+    }
+
+    std::string sourcePath = sourceAsset.GetResolvedPath();
+    if (sourcePath.empty())
+    {
+        sourcePath = sourceAsset.GetAssetPath();
+        if (!PathUtils::IsAbsolutePath(sourcePath))
+        {
+            sourcePath = PathUtils::JoinPaths(mThreadContext->converterContext.GetImportAssetDir(), sourcePath);
+        }
+    }
+
+    PXR_NS::ArResolver& resolver = PXR_NS::ArGetResolver();
+    std::shared_ptr<PXR_NS::ArAsset> sourceAssetFile = resolver.OpenAsset(PXR_NS::ArResolvedPath(sourcePath));
+    if (!sourceAssetFile)
+    {
+        return false;
+    }
+
+    constexpr size_t maxSourceSize = 1024 * 1024;
+    const size_t sourceSize = std::min(sourceAssetFile->GetSize(), maxSourceSize);
+    std::string sourceText(sourceSize, '\0');
+    if (sourceSize > 0 && sourceAssetFile->Read(sourceText.data(), sourceSize, 0) != sourceSize)
+    {
+        return false;
+    }
+
+    static const std::string numberPattern = R"(([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?f?))";
+    static const std::array<const char*, 4> colorNames = {
+        "diffuse_reflection_color",
+        "diffuse_color_constant",
+        "base_color",
+        "tint",
+    };
+
+    for (const char* colorName : colorNames)
+    {
+        const std::regex colorPattern(
+            std::string(R"(\b)") + colorName + R"(\s*:\s*color\s*\(\s*)" + numberPattern + R"(\s*,\s*)" + numberPattern + R"(\s*,\s*)" +
+                numberPattern + R"(\s*\))",
+            std::regex_constants::icase
+        );
+        std::smatch match;
+        if (std::regex_search(sourceText, match, colorPattern))
+        {
+            try
+            {
+                diffuseColor = PXR_NS::GfVec3f(std::stof(match[1].str()), std::stof(match[2].str()), std::stof(match[3].str()));
+                return true;
+            }
+            catch (const std::exception&)
+            {
+                return false;
+            }
+        }
+    }
+
+    return false;
+}
+
 MaterialPtr UsdSdkImporter::PopulateMaterial(const StagePtr& stage, const PXR_NS::UsdShadeMaterial& usdMaterial)
 {
+    auto mdlShader = usdMaterial.ComputeSurfaceSource(PXR_NS::TfToken("mdl"));
     auto previewSurfaceShader = usdMaterial.ComputeSurfaceSource(PXR_NS::UsdShadeTokens->universalRenderContext);
 
     MaterialPtr material;
@@ -1411,6 +1547,30 @@ MaterialPtr UsdSdkImporter::PopulateMaterial(const StagePtr& stage, const PXR_NS
     {
 
         material = PopulateUsdPreviewSurfaceMaterial(stage, previewSurfaceShader);
+    }
+
+    // The public build excludes the MDL runtime above, but can preserve a literal
+    // base color without evaluating MDL. Never replace an existing Preview Surface.
+    if (!material && mdlShader)
+    {
+        PXR_NS::GfVec3f fallbackDiffuseColor;
+        if (GetMdlFallbackDiffuseColor(mdlShader, fallbackDiffuseColor))
+        {
+            material = std::make_shared<Material>();
+            PXR_NS::GfVec3f tint(1.0f);
+            const auto tintInput = mdlShader.GetInput(PXR_NS::TfToken("diffuse_tint"));
+            if (tintInput && !tintInput.HasConnectedSource() && tintInput.Get(&tint))
+            {
+                fallbackDiffuseColor = PXR_NS::GfCompMult(fallbackDiffuseColor, tint);
+            }
+            material->diffuseColor = fallbackDiffuseColor;
+            material->hasDiffuseColor = true;
+            mThreadContext->converterContext.Log("WARNING: Preserving only the MDL base color; textures and other MDL shading are not evaluated.");
+        }
+        else
+        {
+            mThreadContext->converterContext.Log("WARNING: Cannot preserve this MDL material without a USD Preview Surface or readable base color.");
+        }
     }
 
     if (material)
@@ -1426,24 +1586,26 @@ MaterialPtr UsdSdkImporter::PopulateOmniPbrMaterial(const StagePtr& stage, const
 {
     auto material = std::make_shared<Material>();
     PXR_NS::GfVec3f colorConstant(1.0f);
-    GetShaderInputValue(colorConstant, usdShader, "diffuse_color_constant");
+    if (!GetShaderInputValue(colorConstant, usdShader, "diffuse_color_constant"))
+    {
+        // Custom MDL colors supply the base; the tint is applied below.
+        GetMdlFallbackDiffuseColor(usdShader, colorConstant);
+    }
     PXR_NS::GfVec3f diffuseColorFactor(1.0f);
     GetShaderInputValue(diffuseColorFactor, usdShader, "diffuse_tint");
 
     PXR_NS::SdfAssetPath texturePath;
     material->hasDiffuseColor = true;
+    material->diffuseColor = PXR_NS::GfVec3f(
+        diffuseColorFactor[0] * colorConstant[0],
+        diffuseColorFactor[1] * colorConstant[1],
+        diffuseColorFactor[2] * colorConstant[2]
+    );
     if (GetShaderInputValue(texturePath, usdShader, "diffuse_texture") && !texturePath.GetAssetPath().empty())
     {
-        material->GetTextureReference(MaterialTextureType::DIFFUSE).imageIndex = GetOrCreateTexture(stage, texturePath);
-        material->diffuseColor = diffuseColorFactor;
-    }
-    else
-    {
-        material->diffuseColor = PXR_NS::GfVec3f(
-            diffuseColorFactor[0] * colorConstant[0],
-            diffuseColorFactor[1] * colorConstant[1],
-            diffuseColorFactor[2] * colorConstant[2]
-        );
+        auto& texture = material->GetTextureReference(MaterialTextureType::DIFFUSE);
+        texture.imageIndex = GetOrCreateTexture(stage, texturePath);
+        texture.scale = PXR_NS::GfVec4f(material->diffuseColor[0], material->diffuseColor[1], material->diffuseColor[2], 1.0f);
     }
 
     GetShaderInputValue(material->hasEmissiveColor, usdShader, "enable_emission");
@@ -2012,14 +2174,15 @@ MaterialPtr UsdSdkImporter::PopulateGltfMaterial(const StagePtr& stage, const PX
     float emissiveIntensity;
     if (GetShaderInputValue(emissiveIntensity, usdShader, "emissive_strength"))
     {
-        if (emissiveIntensity == DEFAULT_EMISSIVE_INTENSITY)
+        // Older exports used the same value for an absent strength and an
+        // explicit strength of 16. New exports record presence separately.
+        const auto presence = usdShader.GetInput(PXR_NS::TfToken("emissive_strength"))
+                                  .GetAttr()
+                                  .GetCustomDataByKey(PXR_NS::TfToken("omni_hasEmissiveStrength"));
+        material->hasEmissiveStrength = presence.IsHolding<bool>() ? presence.UncheckedGet<bool>() : emissiveIntensity != DEFAULT_EMISSIVE_INTENSITY;
+        if (material->hasEmissiveStrength)
         {
-            material->hasEmissiveStrength = false;
-        }
-        else
-        {
-            material->hasEmissiveStrength = true;
-            material->emissiveStrength = emissiveIntensity;
+            material->emissiveStrength = emissiveIntensity * 16.0f / DEFAULT_EMISSIVE_INTENSITY;
         }
     }
 
@@ -2181,10 +2344,17 @@ TransformAnimationTracks UsdSdkImporter::GetTransformAnimation(const PXR_NS::Usd
             }
             else
             {
-                auto translations = GetXformOpTimesamples<PXR_NS::GfVec3d>(xformPrim, PXR_NS::UsdGeomXformOp::TypeTranslate, startTime, endTime);
-                auto scales = GetXformOpTimesamples<PXR_NS::GfVec3d>(xformPrim, PXR_NS::UsdGeomXformOp::TypeScale, startTime, endTime);
-                auto orients = GetXformOpTimesamples<PXR_NS::GfQuatd>(xformPrim, PXR_NS::UsdGeomXformOp::TypeOrient, startTime, endTime);
-                auto rotations = GetRotationOpTimesamples(xformPrim, startTime, endTime);
+                double translationEnd = -1.0, scaleEnd = -1.0, orientEnd = -1.0, rotationEnd = -1.0;
+                auto translations = GetXformOpTimesamples<PXR_NS::GfVec3d>(
+                    xformPrim,
+                    PXR_NS::UsdGeomXformOp::TypeTranslate,
+                    startTime,
+                    endTime,
+                    translationEnd
+                );
+                auto scales = GetXformOpTimesamples<PXR_NS::GfVec3d>(xformPrim, PXR_NS::UsdGeomXformOp::TypeScale, startTime, endTime, scaleEnd);
+                auto orients = GetXformOpTimesamples<PXR_NS::GfQuatd>(xformPrim, PXR_NS::UsdGeomXformOp::TypeOrient, startTime, endTime, orientEnd);
+                auto rotations = GetRotationOpTimesamples(xformPrim, startTime, endTime, rotationEnd);
                 if (orients.empty())
                 {
                     transformTimesamples = TransformTimesamples(translations, rotations, scales);
@@ -2194,6 +2364,10 @@ TransformAnimationTracks UsdSdkImporter::GetTransformAnimation(const PXR_NS::Usd
                     transformTimesamples = TransformTimesamples(translations, orients, scales);
                 }
 
+                transformTimesamples.SetSampleEndTime(translationEnd, TransformChannel::Translation);
+                transformTimesamples.SetSampleEndTime(scaleEnd, TransformChannel::Scale);
+                transformTimesamples.SetSampleEndTime(orients.empty() ? rotationEnd : orientEnd, TransformChannel::Rotation);
+
                 // Check if it has transform animations
                 if (transformTimesamples.Empty())
                 {
@@ -2201,7 +2375,8 @@ TransformAnimationTracks UsdSdkImporter::GetTransformAnimation(const PXR_NS::Usd
                         xformPrim,
                         PXR_NS::UsdGeomXformOp::TypeTransform,
                         startTime,
-                        endTime
+                        endTime,
+                        translationEnd
                     );
                     for (const auto& transformSample : transformSamples)
                     {
@@ -2211,6 +2386,7 @@ TransformAnimationTracks UsdSdkImporter::GetTransformAnimation(const PXR_NS::Usd
                         orients.push_back(tqs.q);
                     }
                     transformTimesamples = TransformTimesamples(translations, orients, scales);
+                    transformTimesamples.SetSampleEndTime(translationEnd);
                 }
             }
 
@@ -2244,6 +2420,11 @@ StageNodePtr UsdSdkImporter::ImportSkeleton(const PXR_NS::UsdPrim& prim, const S
     {
         StageNodePtr rootBone;
         PXR_NS::UsdSkelSkeletonQuery skelQuery = usdSkelCache.GetSkelQuery(skeleton);
+        if (!skelQuery)
+        {
+            mSkeletonError = "Invalid skeleton '" + skeleton.GetPath().GetString() + "': check joint and rest/bind transform data.";
+            return rootBone;
+        }
 
         std::vector<int> parentJointIndices;
         jointOrder = skelQuery.GetJointOrder();
@@ -2265,6 +2446,12 @@ StageNodePtr UsdSdkImporter::ImportSkeleton(const PXR_NS::UsdPrim& prim, const S
 
             PXR_NS::VtArray<PXR_NS::GfMatrix4d> restTransforms;
             skelQuery.ComputeJointLocalTransforms(&restTransforms, PXR_NS::UsdTimeCode::Default(), true);
+            if (bindTransforms.size() != jointOrder.size() || restTransforms.size() != jointOrder.size() ||
+                parentJointIndices.size() != jointOrder.size())
+            {
+                mSkeletonError = "Invalid skeleton '" + skeleton.GetPath().GetString() + "': transforms must match the joint count.";
+                return rootBone;
+            }
             std::vector<StageNodePtr> indexBoneMap(jointOrder.size());
             for (size_t i = 0; i < jointOrder.size(); ++i)
             {
@@ -2314,11 +2501,32 @@ StageNodePtr UsdSdkImporter::ImportSkeleton(const PXR_NS::UsdPrim& prim, const S
                         {
                             if (timeSamples.size() > 0)
                             {
-                                double totalTimeSample = timeSamples.back();
+                                const double startTime = stage->startTime;
+                                const double endTime = std::max(startTime, std::min(timeSamples.back(), stage->endTime));
                                 std::vector<PXR_NS::VtVec3dArray> boneTranslations(indexBoneMap.size());
                                 std::vector<PXR_NS::VtVec3dArray> boneScales(indexBoneMap.size());
                                 std::vector<PXR_NS::VtQuatdArray> boneOrients(indexBoneMap.size());
-                                for (double timeSample = 0.0; timeSample < totalTimeSample + 1.0; timeSample += 1.0)
+                                // Keep authored interior times and the clipped endpoints. Integer-only
+                                // sampling can erase an entire out-and-back motion between two ticks.
+                                timeSamples.erase(
+                                    std::remove_if(
+                                        timeSamples.begin(),
+                                        timeSamples.end(),
+                                        [&](double time)
+                                        {
+                                            return time < startTime || time > endTime;
+                                        }
+                                    ),
+                                    timeSamples.end()
+                                );
+                                if (endTime >= startTime)
+                                {
+                                    timeSamples.push_back(startTime);
+                                    timeSamples.push_back(endTime);
+                                }
+                                std::sort(timeSamples.begin(), timeSamples.end());
+                                timeSamples.erase(std::unique(timeSamples.begin(), timeSamples.end()), timeSamples.end());
+                                for (double timeSample : timeSamples)
                                 {
                                     PXR_NS::VtArray<PXR_NS::GfMatrix4d> usdJointLocalTransforms;
                                     skelQuery.ComputeJointLocalTransforms(&usdJointLocalTransforms, timeSample);
@@ -2333,6 +2541,10 @@ StageNodePtr UsdSdkImporter::ImportSkeleton(const PXR_NS::UsdPrim& prim, const S
                                         boneOrients[boneIndex].push_back(rotations[boneIndex]);
                                     }
                                 }
+                                for (double& time : timeSamples)
+                                {
+                                    time -= startTime;
+                                }
 
                                 for (size_t boneIndex = 0; boneIndex < indexBoneMap.size(); boneIndex++)
                                 {
@@ -2342,6 +2554,10 @@ StageNodePtr UsdSdkImporter::ImportSkeleton(const PXR_NS::UsdPrim& prim, const S
                                         boneOrients[boneIndex],
                                         boneScales[boneIndex]
                                     );
+                                    for (auto channel : { TransformChannel::Translation, TransformChannel::Rotation, TransformChannel::Scale })
+                                    {
+                                        transformTimesamples.SetSampleTimes(timeSamples, channel);
+                                    }
                                     bone->transformAnimationTracks.push_back(transformTimesamples);
                                 }
                             }
@@ -2402,10 +2618,14 @@ StageNodePtr UsdSdkImporter::ImportSkeleton(const PXR_NS::UsdPrim& prim, const S
 
                 auto skinMesh = std::make_shared<SkinMesh>(stage->meshes.size());
                 skinMesh->geomBindTransform = geomBindingTransform;
-                auto jointWeightPrimvar = skinningQuery.GetJointWeightsPrimvar();
-                jointWeightPrimvar.Get(&skinMesh->jointWeights);
-                auto jointIndicesPrimvar = skinningQuery.GetJointIndicesPrimvar();
-                jointIndicesPrimvar.Get(&skinMesh->jointInfluences);
+                if (!skinningQuery.ComputeVaryingJointInfluences(mesh->points.size(), &skinMesh->jointInfluences, &skinMesh->jointWeights))
+                {
+                    // Leave this mesh for ordinary traversal if its skin data cannot be read.
+                    mThreadContext->converterContext.Log(("WARNING: Cannot read skin influences for " + skinningPrim.GetPath().GetString() +
+                                                          "; importing the mesh without skinning.")
+                                                             .c_str());
+                    continue;
+                }
                 skinMesh->numBoneInfluencesPerVertex = skinningQuery.GetNumInfluencesPerComponent();
                 skinMesh->skeletonRoot = rootBone;
 
@@ -2413,6 +2633,7 @@ StageNodePtr UsdSdkImporter::ImportSkeleton(const PXR_NS::UsdPrim& prim, const S
                 skinningQuery.GetJointOrder(&jointTokens);
                 stage->meshes.push_back(mesh);
                 stage->skinMeshes.push_back(skinMesh);
+                mSkinnedMeshPaths.insert(skinningPrim.GetPath());
                 if (jointTokens.empty())
                 {
                     jointTokens = jointOrder;

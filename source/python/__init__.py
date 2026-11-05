@@ -17,28 +17,31 @@ This module contains bindings and helpers to usd_convert_asset interface. You ca
 """
 
 import asyncio
+import atexit
+import concurrent.futures
 import ctypes
 import glob
 import logging
 import os
 import platform
 import sys
+import threading
 import traceback
 from pathlib import Path
 
 from ._bootstrap import check_pxr_conflict as _check_pxr_conflict
+from ._bootstrap import (
+    load_windows_converter_library as _load_windows_converter_library,
+)
 
 _module_dir = os.path.dirname(__file__)
 _libs_dir = os.path.join(_module_dir, "libs")
 _dll_directory_handles = []
 _logger = logging.getLogger(__name__)
 
-# Warn when a foreign OpenUSD (pxr) copy was imported before us. Python keeps the
-# already-loaded pxr module instead of reloading our bundled build, but mixing USD
-# versions in one process can still corrupt shared Tf/Plug singletons. Run this
-# before preloading any USD-linked native library below. The bundled pxr can land
-# under either python-path layout, so pass both candidates.
-_has_pxr_conflict = _check_pxr_conflict(
+# Python keeps an already-loaded pxr module instead of reloading our bundled
+# build. The bundled pxr can use either Python-path layout.
+_bundled_pxr_dirs = (
     os.path.join(_libs_dir, "python", "pxr"),
     os.path.join(_libs_dir, "lib", "python", "pxr"),
 )
@@ -104,27 +107,49 @@ if sys.platform == "win32":
         raise FileNotFoundError(f"No assimp-vc*-mt.dll found in {_libs_dir}")
     ctypes.WinDLL(str(_assimp_dlls[-1]))
     ctypes.WinDLL(os.path.join(_libs_dir, "libfbxsdk.dll"))
-    ctypes.WinDLL(os.path.join(_libs_dir, "usd_convert_asset.dll"))
-elif sys.platform == "linux":
-    _preload_bundled_libpython()
-    _preload_bundled_draco()
-    ctypes.CDLL(os.path.join(_libs_dir, "libassimp.so"))
-    ctypes.CDLL(os.path.join(_libs_dir, "libxml2.so"), mode=ctypes.RTLD_GLOBAL)
-    _preload_bundled_library("libusd_usdUI.so")
-    # ctypes.CDLL(os.path.join(os.path.dirname(__file__), 'libs/libfbxsdk.so'))
-    ctypes.CDLL(os.path.join(_libs_dir, "libusd_convert_asset.so"))
+    _has_pxr_conflict = _load_windows_converter_library(
+        os.path.join(_libs_dir, "usd_convert_asset.dll"),
+        ctypes.WinDLL,
+        *_bundled_pxr_dirs,
+    )
+else:
+    # Check before any USD-linked native library loads below.
+    _has_pxr_conflict = _check_pxr_conflict(*_bundled_pxr_dirs)
+    if sys.platform == "linux":
+        _preload_bundled_libpython()
+        _preload_bundled_draco()
+        ctypes.CDLL(os.path.join(_libs_dir, "libassimp.so"))
+        ctypes.CDLL(os.path.join(_libs_dir, "libxml2.so"), mode=ctypes.RTLD_GLOBAL)
+        _preload_bundled_library("libusd_usdUI.so")
+        # ctypes.CDLL(os.path.join(os.path.dirname(__file__), 'libs/libfbxsdk.so'))
+        ctypes.CDLL(os.path.join(_libs_dir, "libusd_convert_asset.so"))
 
 if not _has_pxr_conflict:
     _register_bundled_usd_plugins()
 
-# Import the native bindings after a conflict warning to keep the API available.
-# Skipping bundled plugin registration does not make mixed OpenUSD builds safe.
+# Import the native bindings after the conflict check. Compatible mixed builds
+# can load, but failures from incompatible Windows DLLs produce guidance above.
 from ._assetconverter import *
 
 __all__ = ["OmniAssetConverter"]
 
 
 class OmniAssetConverter:
+    """Convert one asset.
+
+    On POSIX, do not fork while a conversion or release is active. Use the
+    ``spawn`` or ``forkserver`` process-start method after converter use.
+    """
+
+    __lifecycle_lock = threading.RLock()
+    __release_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="asset-converter-release"
+    )
+    __active_converters = set()
+    __shutting_down = False
+    __shutdown_done = None
+    __callback_context = threading.local()
+    __exiting = False
     __future_progress_callbacks = {}
     __future_material_loaders = {}
     __read_callback = None
@@ -132,6 +157,14 @@ class OmniAssetConverter:
     __progress_callback_is_set = False
     __material_loader_is_set = False
     __fallback_material_loader = None
+
+    @classmethod
+    def _reset_release_executor_after_fork(cls):
+        # Replace the copied idle executor because its worker does not survive
+        # fork. Forking during an active conversion or release is unsupported.
+        OmniAssetConverter.__release_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="asset-converter-release"
+        )
 
     def __init__(
         self,
@@ -184,7 +217,8 @@ class OmniAssetConverter:
             single_mesh (bool): Export Single props USD even there are native instancing in the imported assets.
                                 By default, it will export separate USD files for instancing assets.
 
-            smooth_normals (bool): Generate smooth normals for every mesh.
+            smooth_normals (bool): Generate smooth normals for meshes without authored normals.
+                                   Authored normals take precedence.
 
             ignore_cameras (bool): Whether to export camera.
 
@@ -234,6 +268,9 @@ class OmniAssetConverter:
             convert_stage_up_z (bool): whether to override asset file's up-axis to be z-axis
         """
 
+        if convert_fbx_to_y_up and convert_fbx_to_z_up:
+            raise ValueError("convert_fbx_to_y_up and convert_fbx_to_z_up are mutually exclusive")
+
         self._in_file = in_file
         self._out_file = out_file
         self._status = OmniConverterStatus.IN_PROGRESS
@@ -267,14 +304,37 @@ class OmniAssetConverter:
         self._convert_stage_up_y = convert_stage_up_y
         self._convert_stage_up_z = convert_stage_up_z
 
-        self._future = None
-        if not OmniAssetConverter.__progress_callback_is_set:
-            omniConverterSetProgressCallback(OmniAssetConverter._importer_progress_callback)
-            OmniAssetConverter.__progress_callback_is_set = True
+        self._release_done = None
+        with OmniAssetConverter.__lifecycle_lock:
+            if OmniAssetConverter.__shutting_down or OmniAssetConverter.__exiting:
+                raise RuntimeError("The converter is shutting down.")
+            self._future = None
+            OmniAssetConverter._ensure_callbacks()
 
-        if not OmniAssetConverter.__material_loader_is_set:
-            omniConverterSetMaterialCallback(OmniAssetConverter._importer_material_loader)
-            OmniAssetConverter.__material_loader_is_set = True
+    @classmethod
+    def _wrap_callback(cls, callback):
+        if callback is None:
+            return None
+
+        def invoke(*args, **kwargs):
+            was_active = getattr(cls.__callback_context, "active", False)
+            cls.__callback_context.active = True
+            try:
+                return callback(*args, **kwargs)
+            finally:
+                cls.__callback_context.active = was_active
+
+        return invoke
+
+    @classmethod
+    def _ensure_callbacks(cls):
+        # Called with the lifecycle lock held, before a worker captures callbacks.
+        if not cls.__progress_callback_is_set:
+            omniConverterSetProgressCallback(cls._wrap_callback(cls._importer_progress_callback))
+            cls.__progress_callback_is_set = True
+        if not cls.__material_loader_is_set:
+            omniConverterSetMaterialCallback(cls._wrap_callback(cls._importer_material_loader))
+            cls.__material_loader_is_set = True
 
     @staticmethod
     def major_version() -> int:
@@ -302,7 +362,7 @@ class OmniAssetConverter:
             callback (Callable[str]): Log callback.
         """
 
-        omniConverterSetLogCallback(callback)
+        omniConverterSetLogCallback(cls._wrap_callback(callback))
 
     @classmethod
     def set_progress_callback(cls, callback):
@@ -314,7 +374,7 @@ class OmniAssetConverter:
             converting future, current progress, and total steps.
         """
 
-        omniConverterSetProgressCallback(callback)
+        omniConverterSetProgressCallback(cls._wrap_callback(callback))
 
     @classmethod
     def set_file_callback(
@@ -355,12 +415,12 @@ class OmniAssetConverter:
             _internal_write_callback = None
 
         omniConverterSetFileCallbacks(
-            mkdir_callback,
-            _internal_write_callback,
-            file_exists_callback,
-            _internal_read_callback,
-            layer_write_callback,
-            file_copy_callback,
+            cls._wrap_callback(mkdir_callback),
+            cls._wrap_callback(_internal_write_callback),
+            cls._wrap_callback(file_exists_callback),
+            cls._wrap_callback(_internal_read_callback),
+            cls._wrap_callback(layer_write_callback),
+            cls._wrap_callback(file_copy_callback),
         )
 
     @classmethod
@@ -430,20 +490,63 @@ class OmniAssetConverter:
 
     @classmethod
     def shutdown(cls):
-        """Cleans up all setups. After this, all callbacks will be reset to fallback ones."""
+        """Cancel and wait for conversions, then reset callbacks.
 
-        cls.__read_callback = None
-        cls.set_file_callback(None, None, None, None, None, None)
-        cls.set_log_callback(None)
-        cls.set_progress_callback(None)
-        cls.set_material_loader(None)
-        cls.set_cache_folder("")
-        omniConverterSetMaterialCallback(None)
-        cls.__material_loader_is_set = False
-        cls.__progress_callback_is_set = False
-        cls.__future_progress_callbacks = {}
-        cls.__future_material_loaders = {}
-        cls.__fallback_material_loader = None
+        Call from the application thread, not from a converter callback: a
+        worker cannot wait for its own callback to finish.
+        """
+
+        # Native workers and callbacks are shared by all converter subclasses.
+        cls = OmniAssetConverter
+        if getattr(cls.__callback_context, "active", False):
+            raise RuntimeError(
+                "Cannot shut down from a converter callback; request shutdown from the application thread."
+            )
+        with cls.__lifecycle_lock:
+            if cls.__shutting_down:
+                done = cls.__shutdown_done
+                owns_shutdown = False
+            else:
+                cls.__shutting_down = True
+                done = cls.__shutdown_done = threading.Event()
+                owns_shutdown = True
+                converters = list(cls.__active_converters)
+
+        if not owns_shutdown:
+            done.wait()
+            return
+
+        try:
+            for converter in converters:
+                converter.cancel()
+            # Native release joins workers with the GIL released. Keep callbacks
+            # alive until every worker (including an ongoing async release) ends.
+            for converter in converters:
+                converter._release_future_sync()
+
+            cls.__read_callback = None
+            cls.set_file_callback(None, None, None, None, None, None)
+            cls.set_log_callback(None)
+            cls.set_progress_callback(None)
+            cls.set_material_loader(None)
+            cls.set_cache_folder("")
+            omniConverterSetMaterialCallback(None)
+            cls.__material_loader_is_set = False
+            cls.__progress_callback_is_set = False
+            cls.__future_progress_callbacks = {}
+            cls.__future_material_loaders = {}
+            cls.__fallback_material_loader = None
+        finally:
+            with cls.__lifecycle_lock:
+                cls.__shutting_down = False
+                done.set()
+
+    @classmethod
+    def _shutdown_at_exit(cls):
+        cls = OmniAssetConverter
+        with cls.__lifecycle_lock:
+            cls.__exiting = True
+        cls.shutdown()
 
     def get_status(self):
         """Gets the status of this task. See `OmniConverterStatus`."""
@@ -458,10 +561,40 @@ class OmniAssetConverter:
     def cancel(self):
         """Cancels this task."""
 
-        if self._future:
-            omniConverterCancelFuture(self._future)
-            self._status = omniConverterCheckFutureStatus(self._future)
-            self._detailed_error = omniConverterGetFutureDetailedError(self._future)
+        with OmniAssetConverter.__lifecycle_lock:
+            if self._future:
+                omniConverterCancelFuture(self._future)
+                self._status = omniConverterCheckFutureStatus(self._future)
+                self._detailed_error = omniConverterGetFutureDetailedError(self._future)
+
+    def _release_future_sync(self):
+        cls = OmniAssetConverter
+        with cls.__lifecycle_lock:
+            future = self._future
+            if future:
+                self._future = None
+                self._release_done = threading.Event()
+            done = self._release_done
+        if not future:
+            if done:
+                done.wait()
+            return
+        try:
+            omniConverterReleaseFuture(future)
+        finally:
+            with cls.__lifecycle_lock:
+                cls.__future_progress_callbacks.pop(future, None)
+                cls.__future_material_loaders.pop(future, None)
+                cls.__active_converters.discard(self)
+                done.set()
+
+    async def _release_future(self):
+        with OmniAssetConverter.__lifecycle_lock:
+            if self._future is None and (self._release_done is None or self._release_done.is_set()):
+                return
+        await asyncio.shield(
+            asyncio.get_running_loop().run_in_executor(OmniAssetConverter.__release_executor, self._release_future_sync)
+        )
 
     async def __aenter__(self):
         flags = 0
@@ -517,39 +650,51 @@ class OmniAssetConverter:
             flags |= OMNI_CONVERTER_FLAGS_STAGE_UP_Z
 
         try:
-            self._future = omniConverterCreateAsset(self._in_file, self._out_file, flags)
-            if self._progress_callback:
-                OmniAssetConverter.__future_progress_callbacks[self._future] = self._progress_callback
+            with OmniAssetConverter.__lifecycle_lock:
+                if OmniAssetConverter.__shutting_down or OmniAssetConverter.__exiting:
+                    raise RuntimeError("The converter is shutting down.")
+                OmniAssetConverter._ensure_callbacks()
+                self._future = omniConverterCreateAsset(self._in_file, self._out_file, flags)
+                self._release_done = None
+                OmniAssetConverter.__active_converters.add(self)
+                if self._progress_callback:
+                    OmniAssetConverter.__future_progress_callbacks[self._future] = self._progress_callback
+                if self._material_loader:
+                    OmniAssetConverter.__future_material_loaders[self._future] = self._material_loader
 
-            if self._material_loader:
-                OmniAssetConverter.__future_material_loaders[self._future] = self._material_loader
-
-            status = OmniConverterStatus.IN_PROGRESS
             while True:
-                status = omniConverterCheckFutureStatus(self._future)
-                if status == OmniConverterStatus.IN_PROGRESS:
-                    await asyncio.sleep(0.1)
-                else:
-                    break
-
-            self._status = status
-            self._detailed_error = omniConverterGetFutureDetailedError(self._future)
+                with OmniAssetConverter.__lifecycle_lock:
+                    # Shutdown can detach the future while this coroutine sleeps.
+                    if not self._future:
+                        break
+                    self._status = omniConverterCheckFutureStatus(self._future)
+                    if self._status != OmniConverterStatus.IN_PROGRESS:
+                        self._detailed_error = omniConverterGetFutureDetailedError(self._future)
+                        break
+                await asyncio.sleep(0.1)
         except Exception as e:
             traceback.print_exc()
             self._status = OmniConverterStatus.UNKNOWN
-            self._detailed_error = f"Failed to convert {self._in_file} with error: str(e)."
+            self._detailed_error = f"Failed to convert {self._in_file} with error: {e}."
+        except BaseException:
+            self.cancel()
+            await self._release_future()
+            raise
 
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        OmniAssetConverter.__future_progress_callbacks.pop(self._future, None)
-        OmniAssetConverter.__future_material_loaders.pop(self._future, None)
-        omniConverterReleaseFuture(self._future)
-        self._future = None
+        await self._release_future()
 
-        # clean up registered callbacks
-        omniConverterSetProgressCallback(None)
-        OmniAssetConverter.__progress_callback_is_set = False
+        with OmniAssetConverter.__lifecycle_lock:
+            if not OmniAssetConverter.__active_converters and not OmniAssetConverter.__shutting_down:
+                omniConverterSetProgressCallback(None)
+                OmniAssetConverter.__progress_callback_is_set = False
+                omniConverterSetMaterialCallback(None)
+                OmniAssetConverter.__material_loader_is_set = False
 
-        omniConverterSetMaterialCallback(None)
-        OmniAssetConverter.__material_loader_is_set = False
+
+# Release native-held Python callbacks before interpreter finalization.
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=OmniAssetConverter._reset_release_executor_after_fork)
+atexit.register(OmniAssetConverter._shutdown_at_exit)

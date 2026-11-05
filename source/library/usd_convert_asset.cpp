@@ -11,8 +11,16 @@
 #include "utils/unicode.h"
 #include "utils/utils.h"
 
+#include <pxr/base/arch/fileSystem.h>
+#include <pxr/base/tf/errorMark.h>
+
 #include <algorithm>
+#include <cstring>
 #include <fstream>
+
+#ifdef _WIN32
+#    include <windows.h>
+#endif
 
 static std::mutex gConverterMutex;
 static OmniConverterLogCallback gConverterLogCallback = nullptr;
@@ -149,8 +157,9 @@ static OmniConverterContext CreateConverterContext(
             return false;
         }
         os.write((const char*)blob->buffer, blob->size);
+        os.close();
 
-        return true;
+        return !os.fail();
     };
 
     static OmniConverterUsdWriter defaultLayerWriteCallback = [](const char* targetPath, const char* layerIdentifier)
@@ -161,57 +170,99 @@ static OmniConverterContext CreateConverterContext(
             return false;
         }
 
-        bool equal = false;
-        PXR_NS::SdfLayerRefPtr targetLayer = nullptr;
-        // Checks paths firstly.
-        if (PathUtils::Equal(layerIdentifier, targetPath))
+        if (PXR_NS::SdfLayer::IsAnonymousLayerIdentifier(targetPath))
         {
-            equal = true;
-        }
-        else
-        {
-            // Otherwise, checkes layer to see if they are the same layer.
-            // It's possible that paths are not equal but layers are equal which is depdendent
-            // on the implementation of resolver.
-            targetLayer = PXR_NS::SdfLayer::FindOrOpen(targetPath);
-            if (targetLayer == layer)
+            auto targetLayer = PXR_NS::SdfLayer::Find(targetPath);
+            if (!targetLayer)
             {
-                equal = true;
+                return false;
+            }
+            if (targetLayer != layer)
+            {
+                targetLayer->TransferContent(layer);
+            }
+            return true;
+        }
+
+        // Export away from the destination so a partial USD write cannot replace it.
+        const std::string parent = PathUtils::GetDirName(targetPath);
+        const std::string temporaryName = "layer." + PathUtils::GetExtension(targetPath);
+        std::string directory;
+#ifdef _WIN32
+        // Leave room for our directory/name and OpenUSD's own temporary filename.
+        const bool copyToDestination = Unicode::convert(PathUtils::AbsPath(parent)).size() + temporaryName.size() + 32 >= 260;
+        if (copyToDestination)
+        {
+            if (!PathUtils::CreateTempFolder(directory))
+            {
+                return false;
             }
         }
-
-        if (equal)
-        {
-            if (layer->IsAnonymous())
-            {
-                return true;
-            }
-
-            return layer->Save();
-        }
-
-        if (!targetLayer)
-        {
-            auto format = PXR_NS::SdfFileFormat::FindByExtension(targetPath);
-            targetLayer = PXR_NS::SdfLayer::New(format, targetPath);
-        }
         else
+#endif
         {
-            targetLayer->Clear();
+            directory = PXR_NS::ArchMakeTmpSubdir(parent, ".uca");
         }
-
-        if (!targetLayer)
+        if (directory.empty())
         {
             return false;
         }
-
-        targetLayer->TransferContent(layer);
-        if (!targetLayer->IsAnonymous())
+        struct TemporaryDirectory
         {
-            return targetLayer->Save();
+            std::string path;
+            ~TemporaryDirectory()
+            {
+                PathUtils::RemoveAll(path);
+            }
+        } cleanup{ directory };
+        const std::string temporaryPath = PathUtils::JoinPaths(directory, temporaryName);
+        PXR_NS::TfErrorMark errors;
+        const bool exported = layer->Export(temporaryPath);
+        const bool readable = exported && errors.IsClean() && bool(PXR_NS::SdfLayer::OpenAsAnonymous(temporaryPath));
+        const bool clean = errors.IsClean();
+        errors.Clear();
+        if (!readable || !clean)
+        {
+            return false;
         }
-
-        return true;
+#ifdef _WIN32
+        if (copyToDestination)
+        {
+            // OpenUSD cannot write extended paths. Copy the validated file beside
+            // the destination with Win32, then replace it with a same-volume rename.
+            std::wstring destinationDirectory = Unicode::convert(PathUtils::AbsPath(parent));
+            std::replace(destinationDirectory.begin(), destinationDirectory.end(), L'/', L'\\');
+            destinationDirectory = destinationDirectory.rfind(L"\\\\", 0) == 0 ? L"\\\\?\\UNC\\" + destinationDirectory.substr(2) :
+                                                                                 L"\\\\?\\" + destinationDirectory;
+            if (destinationDirectory.back() != L'\\')
+            {
+                destinationDirectory += L'\\';
+            }
+            destinationDirectory += L".uca-" + Unicode::convert(PathUtils::GetFileName(directory, true));
+            if (!CreateDirectoryW(destinationDirectory.c_str(), nullptr))
+            {
+                return false;
+            }
+            const std::wstring stagedPath = destinationDirectory + L"\\" + Unicode::convert(temporaryName);
+            struct StagedFile
+            {
+                std::wstring directory;
+                std::wstring file;
+                ~StagedFile()
+                {
+                    // Keep cleanup on the same extended-path-aware APIs.
+                    DeleteFileW(file.c_str());
+                    RemoveDirectoryW(directory.c_str());
+                }
+            } destinationCleanup{ destinationDirectory, stagedPath };
+            if (!CopyFileW(Unicode::convert(temporaryPath).c_str(), stagedPath.c_str(), TRUE))
+            {
+                return false;
+            }
+            return PathUtils::ReplaceOutputFile(Unicode::convert(stagedPath.c_str()), targetPath);
+        }
+#endif
+        return PathUtils::ReplaceOutputFile(temporaryPath, targetPath);
     };
 
     static OmniConverterProgressReporter defaultProgressReporter = [](OmniConverterFuture* future, uint32_t progress, uint32_t total)
@@ -224,12 +275,13 @@ static OmniConverterContext CreateConverterContext(
         callbacks.logCallback = gConverterLogCallback ? gConverterLogCallback : defaultLogCallback;
         callbacks.readCallback = gConverterReadCallback ? gConverterReadCallback : defaultReadCallback;
         callbacks.binaryWriteCallback = gConverterBinaryWriteCallback ? gConverterBinaryWriteCallback : defaultBinaryWriteCallback;
+        callbacks.usesDefaultBinaryWriter = !gConverterBinaryWriteCallback;
         callbacks.makeDirsCallback = gConverterMakeDirsCallback ? gConverterMakeDirsCallback : defaultMakeDirCallback;
         callbacks.pathExistsCallback = gConverterPathExistsCallback ? gConverterPathExistsCallback : defaultPathExistsCallback;
         callbacks.progressCallback = gConverterProgressReporter ? gConverterProgressReporter : defaultProgressReporter;
         callbacks.layerWriteCallback = gConverterLayerWriteCallback ? gConverterLayerWriteCallback : defaultLayerWriteCallback;
+        callbacks.usesDefaultLayerWriter = !gConverterLayerWriteCallback;
         callbacks.fileCopyCallback = gConverterFileCopyCallback ? gConverterFileCopyCallback : nullptr;
-
         // For in-memory import, material loader will be disabled.
         if (outputAssetPath && !PXR_NS::SdfLayer::IsAnonymousLayerIdentifier(outputAssetPath))
         {
@@ -294,6 +346,35 @@ OMNI_ASSET_CONVERTER_EXPORT const char* omniConverterGetFutureDetailedError(Omni
     return future->GetDetailedError().c_str();
 }
 
+OMNI_ASSET_CONVERTER_EXPORT void omniConverterSetFutureCallbackError(OmniConverterFuture* future, const char* error)
+{
+    if (future && error)
+    {
+        future->SetCallbackError(error);
+    }
+}
+
+OMNI_ASSET_CONVERTER_EXPORT size_t omniConverterGetFutureTemporaryOutputDirectory(OmniConverterFuture* future, char* path, size_t pathSize)
+{
+    if (!future)
+    {
+        return 0;
+    }
+
+    const std::string directory = future->GetTemporaryOutputDirectory();
+    if (directory.empty())
+    {
+        return 0;
+    }
+
+    const size_t requiredSize = directory.size() + 1;
+    if (path && pathSize >= requiredSize)
+    {
+        std::memcpy(path, directory.c_str(), requiredSize);
+    }
+    return requiredSize;
+}
+
 OMNI_ASSET_CONVERTER_EXPORT void omniConverterCancelFuture(OmniConverterFuture* future)
 {
     future->Stop();
@@ -301,7 +382,10 @@ OMNI_ASSET_CONVERTER_EXPORT void omniConverterCancelFuture(OmniConverterFuture* 
 
 OMNI_ASSET_CONVERTER_EXPORT void omniConverterReleaseFuture(OmniConverterFuture* future)
 {
-    delete future;
+    if (future)
+    {
+        future->Release();
+    }
 }
 
 OMNI_ASSET_CONVERTER_EXPORT OmniConverterAssetHandle* omniConverterOpenAsset(const char* assetPath)

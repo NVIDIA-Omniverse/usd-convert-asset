@@ -43,11 +43,17 @@ For format-specific notes and sidecar handling, read `references/format-support.
 
 ## Instructions
 
-1. Confirm the source asset exists and has a supported input extension.
-2. Confirm the requested output path has a supported USD extension (`.usd`, `.usda`, `.usdc`, or `.usdz`). If the user asks for any unsupported input or output format, state that it is unsupported and offer the supported formats. Do not construct the unsupported deliverable using other tools unless the user explicitly asks for a workaround.
-3. Choose CLI flags from the user's intent for materials, animation, mesh handling, FBX up-axis conversion, stage up-axis, progress, or debug logging. Use only the flags the user's request requires. Do not add optional flags (for example `--ignore-materials`) unless the user asks for that behavior.
-4. Run `usd-convert-asset` from the Python environment where the package is installed.
-5. Return the exact command, output path, and any warnings or validation results.
+1. If the user requests Gaussian Splat `.ply` conversion, redirect the user to `usd-convert-gsplat` and name that tool explicitly. Do not create a substitute converter unless the user explicitly requests a workaround.
+2. Confirm the source asset exists and has a supported input extension.
+3. Confirm the requested output path has a supported USD extension (`.usd`, `.usda`, `.usdc`, or `.usdz`). If the user asks for any unsupported input or output format, state that it is unsupported and offer the supported formats. Do not construct the unsupported deliverable using other tools unless the user explicitly asks for a workaround.
+4. Confirm each requested flag through the installed command's `usd-convert-asset --help` output. Check `references/cli-flags.md` for format-specific restrictions. Do not pass an unavailable or inapplicable flag. If a requested flag is unavailable or inapplicable, explain the limitation and offer a supported alternative if one exists. If no supported flag provides the requested capability, state that limitation. Do not substitute another flag or mechanism unless the user explicitly requests a workaround.
+5. For one FBX import, pass at most one of `--fbx-y-up` and `--fbx-z-up`. For one output stage, pass at most one of `--stage-up-y` and `--stage-up-z`. If the user requests both axes for either scope, state that the request is unsupported and ask the user to choose one axis for each affected scope. Do not pass both flags or select an axis for the user. One FBX flag and one stage flag may appear together because they control different scopes.
+6. Choose only the flags required by the user's intent. Do not add optional flags such as `--ignore-materials` unless the user requests that behavior.
+7. Run `usd-convert-asset` from the Python environment where the package is installed.
+8. Check the process exit code. Treat every nonzero exit code as a failed conversion.
+9. After a zero exit code, confirm the output path is a non-empty regular file produced or updated by this command. A pre-existing file alone is not success evidence.
+10. Report success only after the exit-code and output checks pass. Return the exact command, output path, and verification result.
+11. Describe a requested effect only when output inspection confirms it. Otherwise, state which flag was passed and that its effect was not verified.
 
 ## Examples
 
@@ -61,13 +67,19 @@ python -m usd_convert_asset -i scene.obj -o scene.usdc
 # Print conversion progress
 usd-convert-asset -i scene.fbx -o scene.usdc --progress
 
-# Package as USDZ with portable materials
+# Package as USDZ
 usd-convert-asset -i scene.fbx -o scene.usdz
 ```
 
 ## CLI Flags
 
-Prefer `usd-convert-asset --help` for current CLI flag details. If the task requires an offline flag matrix or examples for selecting flags, read `references/cli-flags.md`.
+Use `usd-convert-asset --help` to confirm current CLI syntax before passing a flag. Read `references/cli-flags.md` for format applicability and selection examples.
+
+The `--single-props-file` flag places copied texture sidecars under
+`materials/textures/` instead of `textures/`. Include this layout change when
+you explain or verify the flag's effects.
+
+When materials are exported, the converter authors USD Preview Surface materials for all supported USD output formats.
 
 ## Python API
 
@@ -93,7 +105,7 @@ Use the smallest verification that covers the changed surface:
 
 ## Output Format
 
-For a completed conversion, return:
+Use the success format only after the command returns zero and produces or updates a non-empty output file:
 
 ```markdown
 Converted `<input>` to `<output>` with `usd-convert-asset`.
@@ -101,26 +113,42 @@ Converted `<input>` to `<output>` with `usd-convert-asset`.
 Command:
 `usd-convert-asset -i <input> -o <output> [options]`
 
-Notes:
-- <materials/animation/mesh/up-axis choices, if any>
-- <warnings or validation results, if any>
+Verification:
+- Exit code: 0
+- Output: `<output>` was produced or updated and is non-empty
+- Effects: <confirmed output effects, or "not inspected">
 ```
 
-For usage guidance or troubleshooting, return a short explanation with the exact CLI command, package entry point, output path, warnings, or verification result the user needs.
+If the command returns nonzero, or the output check fails, use this failure format:
+
+```markdown
+Conversion failed for `<input>`.
+
+Command:
+`usd-convert-asset -i <input> -o <output> [options]`
+
+Exit code: <exit code>
+Error:
+<relevant stderr or output-check failure>
+```
+
+Never use the success statement for a failed or unverified conversion. Do not claim an effect that output inspection did not confirm.
+
+For usage guidance, return a short explanation with the exact command, output path, warning, or verification result.
 
 ## Limitations
 
 - Supported standalone CLI inputs are `.fbx`, `.obj`, `.gltf`, `.glb`, `.stl`, and `.ply`.
 - Supported outputs are `.usd`, `.usda`, `.usdc`, and `.usdz`. Any other format (for example non-USD deliverables such as images) is unsupported; refuse it and offer a supported format rather than packaging or rendering with other tools unless the user explicitly asks for a workaround.
-- For `.usdz`, the CLI enables USD Preview Surface when materials are exported. It then packages a temporary `.usdc` layer with OpenUSD.
+- When materials are exported, the converter authors USD Preview Surface materials for all supported USD output formats.
+- For `.usdz`, the CLI packages a temporary `.usdc` layer with OpenUSD.
 - Sidecars such as `.mtl`, `.mdl`, image files, `.bin`, `.xml`, and `.mcx` are supporting files, not standalone conversion inputs.
 - Linux aarch64 converts FBX through Assimp rather than Autodesk FBX SDK.
 - FBX NURBS curve preservation requires the Autodesk FBX SDK path used on Windows x86_64 and Linux x86_64. Valid static curves are preserved as `UsdGeomNurbsCurves`; invalid curves are skipped with a warning, animated control-point deformation is not covered, and Linux aarch64 does not provide this support.
 - This skill does not cover Gaussian Splat, URDF, CAD-native, or unrelated USD workflows unless `usd-convert-asset` is the relevant converter.
-- High-fidelity Gaussian Splat conversion from `.ply` is not provided here; use a Gaussian Splat-specific converter, such as `usd-convert-gsplat`, for that workflow.
+- High-fidelity Gaussian Splat conversion from `.ply` is not provided here. Redirect the user to `usd-convert-gsplat` and name that tool explicitly.
 - The Python package currently exposes version metadata only.
 - Wheel builds and smoke tests depend on staged, platform-specific native runtime libraries.
-- `--stage-up-y` and `--stage-up-z` are mutually exclusive.
 
 ## Troubleshooting
 

@@ -20,6 +20,7 @@
 #    include <unistd.h>
 #endif
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #ifndef _WIN32
@@ -30,6 +31,10 @@
 #include <experimental/filesystem>
 #include <iomanip>
 #include <sstream>
+#ifdef _WIN32
+#    include <chrono>
+#    include <thread>
+#endif
 
 namespace fs = std::experimental::filesystem;
 
@@ -37,6 +42,73 @@ namespace
 {
 constexpr size_t kTempFolderRandomByteCount = 16;
 constexpr size_t kTempFolderMaxTries = 100;
+
+#ifdef _WIN32
+constexpr int kRenameMaxAttempts = 10;
+constexpr auto kRenameRetryDelay = std::chrono::milliseconds(10);
+
+bool IsReservedWindowsDeviceName(const fs::path& component)
+{
+    std::wstring name = component.native();
+
+    // Windows resolves a device name before a file extension or an alternate data-stream suffix.
+    // For example, "CON.txt" and "CON:stream" both refer to the CON device.
+    const auto separator = name.find_first_of(L".:");
+    if (separator != std::wstring::npos)
+    {
+        name.resize(separator);
+    }
+
+    // Win32 ignores trailing spaces and periods when it resolves a path component.
+    while (!name.empty() && (name.back() == L' ' || name.back() == L'.'))
+    {
+        name.pop_back();
+    }
+
+    // Device-name matching is case-insensitive. Only ASCII letters occur in reserved names.
+    for (auto& character : name)
+    {
+        if (character >= L'a' && character <= L'z')
+        {
+            character -= L'a' - L'A';
+        }
+    }
+
+    // These names refer to DOS character devices in every Windows directory.
+    if (name == L"CON" || name == L"CONIN$" || name == L"CONOUT$" || name == L"PRN" || name == L"AUX" || name == L"NUL")
+    {
+        return true;
+    }
+
+    // COM and LPT are reserved only with a recognized one-character port number.
+    if (name.size() != 4 || (name.compare(0, 3, L"COM") != 0 && name.compare(0, 3, L"LPT") != 0))
+    {
+        return false;
+    }
+    const wchar_t suffix = name.back();
+
+    // Windows also recognizes the ISO-8859-1 superscript forms for ports 1, 2, and 3.
+    return (suffix >= L'1' && suffix <= L'9') || suffix == L'\u00b9' || suffix == L'\u00b2' || suffix == L'\u00b3';
+}
+
+std::wstring ToExtendedWindowsPath(const fs::path& path)
+{
+    std::wstring native = path.native();
+    std::replace(native.begin(), native.end(), L'/', L'\\');
+    if (native.rfind(L"\\\\?\\", 0) == 0)
+    {
+        return native;
+    }
+
+    native = fs::absolute(path).native();
+    std::replace(native.begin(), native.end(), L'/', L'\\');
+    if (native.rfind(L"\\\\", 0) == 0)
+    {
+        return L"\\\\?\\UNC\\" + native.substr(2);
+    }
+    return L"\\\\?\\" + native;
+}
+#endif
 
 bool FillRandomBytes(uint8_t* data, size_t size)
 {
@@ -230,7 +302,22 @@ bool PathUtils::MakeDirectories(const std::string& dir, std::string* error)
     }
 
     std::error_code ec;
-    return fs::create_directories(fs::u8path(dir), ec);
+    const auto path = fs::u8path(dir);
+    if (fs::create_directories(path, ec))
+    {
+        return true;
+    }
+    // Another conversion may have created the directory after the existence check.
+    std::error_code statusError;
+    if (fs::is_directory(path, statusError))
+    {
+        return true;
+    }
+    if (error)
+    {
+        *error = ec ? ec.message() : "Path is not a directory: " + dir;
+    }
+    return false;
 }
 
 std::string PathUtils::GetDirName(const std::string& path)
@@ -582,6 +669,36 @@ std::string PathUtils::MimeToExt(const std::string& mimeType)
 
 bool PathUtils::Rename(const std::string& from, const std::string& to)
 {
+#ifdef _WIN32
+    try
+    {
+        // Replace an existing file without first deleting it or falling back to a copy.
+        const auto source = ToExtendedWindowsPath(fs::u8path(from));
+        const auto target = ToExtendedWindowsPath(fs::u8path(to));
+        for (int attempt = 0; attempt < kRenameMaxAttempts; ++attempt)
+        {
+            if (MoveFileExW(source.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING) != 0)
+            {
+                return true;
+            }
+
+            const DWORD error = GetLastError();
+            if (error != ERROR_ACCESS_DENIED && error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION)
+            {
+                return false;
+            }
+            if (attempt + 1 < kRenameMaxAttempts)
+            {
+                std::this_thread::sleep_for(kRenameRetryDelay);
+            }
+        }
+        return false;
+    }
+    catch (const fs::filesystem_error&)
+    {
+        return false;
+    }
+#else
     fs::path f(from);
     fs::path t(to);
     std::error_code ec;
@@ -596,11 +713,163 @@ bool PathUtils::Rename(const std::string& from, const std::string& to)
     {
         return true;
     }
+#endif
+}
+
+bool PathUtils::ValidateOutputPath(const std::string& path, std::string& error)
+{
+#ifdef _WIN32
+    const auto requestedTarget = fs::u8path(path);
+    for (const auto& component : requestedTarget)
+    {
+        if (IsReservedWindowsDeviceName(component))
+        {
+            error = "Cannot replace output " + path + ": path contains a reserved Windows device name";
+            return false;
+        }
+    }
+#else
+    static_cast<void>(path);
+    static_cast<void>(error);
+#endif
+    return true;
+}
+
+bool PathUtils::CheckOutputReplaceable(const std::string& path, std::string& error)
+{
+    const auto fail = [&](const std::string& reason)
+    {
+        error = "Cannot replace output " + path + ": " + reason;
+        return false;
+    };
+    const auto requestedTarget = fs::u8path(path);
+    if (!ValidateOutputPath(path, error))
+    {
+        return false;
+    }
+    try
+    {
+        const auto target = fs::absolute(requestedTarget);
+        const auto parent = target.parent_path();
+#ifdef _WIN32
+        const auto nativeTarget = ToExtendedWindowsPath(target);
+        const DWORD attributes = GetFileAttributesW(nativeTarget.c_str());
+        const bool existing = attributes != INVALID_FILE_ATTRIBUTES;
+        if (!existing)
+        {
+            const DWORD code = GetLastError();
+            if (code != ERROR_FILE_NOT_FOUND && code != ERROR_PATH_NOT_FOUND)
+            {
+                return fail(std::error_code(code, std::system_category()).message());
+            }
+        }
+        else if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 || (attributes & FILE_ATTRIBUTE_READONLY) != 0)
+        {
+            return fail("destination is not a writable regular file");
+        }
+#else
+        const long configuredLimit = pathconf(parent.c_str(), _PC_PATH_MAX);
+        const size_t limit = configuredLimit > 0 ? static_cast<size_t>(configuredLimit) : 4096;
+        const size_t length = target.native().size();
+        const size_t parentLength = parent.native().size();
+        if (length >= limit)
+        {
+            return fail("path exceeds the filesystem limit");
+        }
+
+        const bool existing = fs::exists(target);
+        if (existing)
+        {
+            const auto status = fs::status(target);
+            const auto writePermissions = fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write;
+            if (!fs::is_regular_file(status) || (status.permissions() & writePermissions) == fs::perms::none)
+            {
+                return fail("destination is not a writable regular file");
+            }
+        }
+#endif
+
+        // Open an existing target without truncation. Use a short sibling file
+        // to verify that a new target can be created and replaced.
+        const auto probe = [&](const fs::path& candidate, bool openExisting)
+        {
+#ifdef _WIN32
+            const auto nativeCandidate = ToExtendedWindowsPath(candidate);
+            HANDLE handle = CreateFileW(
+                nativeCandidate.c_str(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr,
+                openExisting ? OPEN_EXISTING : CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr
+            );
+            if (handle == INVALID_HANDLE_VALUE)
+            {
+                return fail(std::error_code(GetLastError(), std::system_category()).message());
+            }
+            DWORD written = 0;
+            const bool success = openExisting || (WriteFile(handle, "0", 1, &written, nullptr) && written == 1);
+            const bool closed = CloseHandle(handle) != 0;
+            const bool removed = openExisting || DeleteFileW(nativeCandidate.c_str()) != 0;
+#else
+            const int descriptor = open(candidate.c_str(), O_WRONLY | O_CLOEXEC | (openExisting ? 0 : O_CREAT | O_EXCL), 0600);
+            if (descriptor < 0)
+            {
+                return fail(std::error_code(errno, std::generic_category()).message());
+            }
+            const bool success = openExisting || write(descriptor, "0", 1) == 1;
+            const bool closed = close(descriptor) == 0;
+            const bool removed = openExisting || unlink(candidate.c_str()) == 0;
+#endif
+            if (!success || !closed || !removed)
+            {
+                return fail("could not write or clean up the output probe");
+            }
+            return true;
+        };
+
+        if (existing && !probe(target, true))
+        {
+            return false;
+        }
+
+        std::array<uint8_t, 6> bytes;
+        if (!FillRandomBytes(bytes.data(), bytes.size()))
+        {
+            return fail("cannot generate a temporary filename");
+        }
+        std::ostringstream name;
+        for (const auto byte : bytes)
+        {
+            name << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(byte);
+        }
+#ifdef _WIN32
+        const auto candidate = parent / name.str();
+#else
+        const auto candidate = parent / name.str().substr(0, std::min<size_t>(12, limit - parentLength - 2));
+#endif
+        return probe(candidate, false);
+    }
+    catch (const fs::filesystem_error& exception)
+    {
+        return fail(exception.what());
+    }
+}
+
+bool PathUtils::ReplaceOutputFile(const std::string& from, const std::string& to)
+{
+    std::string error;
+    if (!CheckOutputReplaceable(to, error))
+    {
+        return false;
+    }
+    return Rename(from, to);
 }
 
 bool PathUtils::RemoveAll(const std::string& path)
 {
-    fs::path p(path);
+    fs::path p = fs::u8path(path);
     std::error_code ec;
     fs::remove_all(p, ec);
 

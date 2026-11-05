@@ -7,6 +7,7 @@
 #include "pxr_includes.h"
 #include "usd_convert_asset_internal.h"
 
+#include <array>
 #include <memory>
 #include <vector>
 
@@ -234,7 +235,7 @@ struct Material
     PXR_NS::GfVec3f emissiveColor = PXR_NS::GfVec3f(0.0f, 0.0f, 0.0f);
 
     bool hasEmissiveStrength = false;
-    float emissiveStrength = 1.0f;
+    float emissiveStrength = 1.0f; // Linear multiplier; convert to renderer-specific units only during export.
 
     GLTFOpacityMode opacityMode = GLTFOpacityMode::GLTF_OPAQUE; // Alpha mode for glTF
     bool hasOpacity = false;
@@ -562,6 +563,13 @@ private:
     mutable PXR_NS::GfVec3d mPivot = ZERO_VEC_3D;
 };
 
+enum class TransformChannel
+{
+    Translation,
+    Rotation,
+    Scale
+};
+
 struct TransformTimesamples
 {
 public:
@@ -570,23 +578,54 @@ public:
     {
     }
 
-    // <t, r, s> must have the same size, or part of them are empty.
+    // Channels may have different sizes when explicit sample times are provided.
     TransformTimesamples(const PXR_NS::VtVec3dArray& t, const PXR_NS::VtVec3dArray& r, const PXR_NS::VtVec3dArray& s)
         : mTranslations(t), mScales(s), mRotationXYZ(r)
     {
     }
 
-    // <t, q, s> must have the same size, or part of them are empty.
+    // Channels may have different sizes when explicit sample times are provided.
     TransformTimesamples(const PXR_NS::VtVec3dArray& t, const PXR_NS::VtQuatdArray& q, const PXR_NS::VtVec3dArray& s)
         : mTranslations(t), mScales(s), mOrients(q)
     {
+    }
+
+    // Samples normally lie on whole ticks; an imported clip may end between ticks.
+    void SetSampleEndTime(double time)
+    {
+        mSampleEndTimes.fill(time);
+    }
+    void SetSampleEndTime(double time, TransformChannel channel)
+    {
+        mSampleEndTimes[static_cast<size_t>(channel)] = time;
+    }
+    // Explicit keys interpolate between source ticks unless held poses are requested.
+    void SetSampleTimes(std::vector<double> times, TransformChannel channel, bool interpolate = true)
+    {
+        mSampleTimes[static_cast<size_t>(channel)] = std::move(times);
+        mInterpolateSamples[static_cast<size_t>(channel)] = interpolate;
+    }
+    bool InterpolatesSamples(TransformChannel channel) const
+    {
+        return mInterpolateSamples[static_cast<size_t>(channel)];
+    }
+    double GetSampleTime(size_t index, TransformChannel channel = TransformChannel::Translation) const
+    {
+        const auto& times = mSampleTimes[static_cast<size_t>(channel)];
+        if (!times.empty())
+        {
+            return times[index];
+        }
+        const double time = static_cast<double>(index);
+        const double endTime = mSampleEndTimes[static_cast<size_t>(channel)];
+        return endTime >= 0.0 && time > endTime ? endTime : time;
     }
 
     bool Empty() const;
 
     size_t Size() const
     {
-        // <t, r, s> or <t, q, s> are saved with equal size or part of them are empty.
+        // Return the size of the first populated channel.
         if (mTranslations.size() > 0)
         {
             return mTranslations.size();
@@ -631,6 +670,9 @@ public:
 
 private:
 
+    std::array<bool, 3> mInterpolateSamples = { false, false, false };
+    std::array<std::vector<double>, 3> mSampleTimes;
+    std::array<double, 3> mSampleEndTimes = { -1.0, -1.0, -1.0 };
     PXR_NS::VtVec3dArray mTranslations;
     mutable PXR_NS::VtVec3dArray mRotationXYZ;
     mutable PXR_NS::VtQuatdArray mOrients;
@@ -724,6 +766,7 @@ struct Mesh
     PXR_NS::VtArray<PXR_NS::VtIntArray> uvIndices; // Face uv mapping.
     PXR_NS::VtArray<PXR_NS::VtArray<PXR_NS::GfVec3f>> colors; // Face varying colors
     std::vector<MeshGeomSubset> meshSubsets; // If it has only one mesh subset, it's whole mesh.
+    bool doubleSided = false;
     bool hasFaceVaryingNormals = false;
     bool hasFaceVaryingUVs = false;
     bool hasFaceVaryingColors = false;
@@ -844,10 +887,20 @@ struct AnimationTrack
     std::string name;
     size_t keyFrames = 0;
     double fps = 24.0;
+    // Exact duration in source ticks, when supplied by the importer.
+    double duration = -1.0;
+
+    double GetSampleTime(size_t index) const
+    {
+        const double time = static_cast<double>(index);
+        return duration >= 0.0 && time > duration ? duration : time;
+    }
 };
 
 struct Stage
 {
+    // Partial imports may succeed only while usable geometry survives cleanup.
+    bool hasSkippedCorruptGeometry = false;
     bool yAxis = true;
     double worldUnits = 0.01; // CM by default
     StageNodePtr rootNode;

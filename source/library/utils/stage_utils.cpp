@@ -79,6 +79,10 @@ bool IsZeroAreaFace(const Mesh& mesh, size_t faceVertexOffset, size_t faceVertex
         {
             return true;
         }
+        if (faceVertexCount == 3 && (origin == second || origin == point || second == point))
+        {
+            return true;
+        }
         const PXR_NS::GfVec3f current = point - origin;
         vectorArea += PXR_NS::GfCross(previous, current);
         previous = current;
@@ -474,7 +478,7 @@ bool ValidatePointData(const Stage& stage, const MeshPtr& mesh, PointDataDomains
 
     for (const auto& frame : mesh->pointCacheTimesamples)
     {
-        if (!HasPointCount(frame))
+        if (frame.empty() || !HasPointCount(frame))
         {
             return false;
         }
@@ -760,6 +764,194 @@ bool CompactMeshPointsAfterTopologyRepair(Stage& stage, const MeshPtr& mesh)
     CompactSkinData(stage, meshIndex, pointRemap.keptPointIndices);
     return true;
 }
+
+bool GenerateSmoothNormalsForPoints(const Mesh& mesh, const PXR_NS::VtVec3fArray& points, PXR_NS::VtVec3fArray& smoothNormals)
+{
+    if (points.size() != mesh.points.size())
+    {
+        return false;
+    }
+
+    PXR_NS::VtVec3fArray accumulatedNormals(points.size(), PXR_NS::GfVec3f(0.0f));
+    std::vector<std::vector<PXR_NS::GfVec3f>> neighborPositions(points.size());
+    size_t faceVertexOffset = 0;
+    for (int faceVertexCount : mesh.faceVertexCounts)
+    {
+        if (faceVertexCount < 0 || faceVertexOffset + static_cast<size_t>(faceVertexCount) > mesh.faceVertexIndices.size())
+        {
+            return false;
+        }
+        if (faceVertexCount < 3)
+        {
+            faceVertexOffset += static_cast<size_t>(faceVertexCount);
+            continue;
+        }
+
+        for (int faceVertexIndex = 0; faceVertexIndex < faceVertexCount; ++faceVertexIndex)
+        {
+            const int pointIndex = mesh.faceVertexIndices[faceVertexOffset + static_cast<size_t>(faceVertexIndex)];
+            if (pointIndex < 0 || static_cast<size_t>(pointIndex) >= points.size() || !IsFinite(points[pointIndex]))
+            {
+                return false;
+            }
+        }
+
+        const int firstPointIndex = mesh.faceVertexIndices[faceVertexOffset];
+        const auto& firstPoint = points[firstPointIndex];
+        PXR_NS::GfVec3f faceNormal(0.0f);
+        PXR_NS::GfVec3f fallbackFaceNormal(0.0f);
+        for (int triangleIndex = 1; triangleIndex + 1 < faceVertexCount; ++triangleIndex)
+        {
+            const int secondPointIndex = mesh.faceVertexIndices[faceVertexOffset + static_cast<size_t>(triangleIndex)];
+            const int thirdPointIndex = mesh.faceVertexIndices[faceVertexOffset + static_cast<size_t>(triangleIndex + 1)];
+            const auto triangleNormal = (points[secondPointIndex] - firstPoint) ^ (points[thirdPointIndex] - firstPoint);
+            faceNormal += triangleNormal;
+            if (fallbackFaceNormal.GetLengthSq() == 0.0f && triangleNormal.GetLengthSq() > 0.0f)
+            {
+                fallbackFaceNormal = triangleNormal;
+            }
+        }
+
+        float faceNormalLengthSquared = faceNormal.GetLengthSq();
+        if (!std::isfinite(faceNormalLengthSquared) || faceNormalLengthSquared == 0.0f)
+        {
+            faceNormal = fallbackFaceNormal;
+            faceNormalLengthSquared = faceNormal.GetLengthSq();
+        }
+        if (!std::isfinite(faceNormalLengthSquared) || faceNormalLengthSquared == 0.0f)
+        {
+            faceVertexOffset += static_cast<size_t>(faceVertexCount);
+            continue;
+        }
+        faceNormal /= std::sqrt(faceNormalLengthSquared);
+
+        for (int faceVertexIndex = 0; faceVertexIndex < faceVertexCount; ++faceVertexIndex)
+        {
+            const size_t currentOffset = faceVertexOffset + static_cast<size_t>(faceVertexIndex);
+            const size_t previousOffset = faceVertexOffset + static_cast<size_t>((faceVertexIndex + faceVertexCount - 1) % faceVertexCount);
+            const size_t nextOffset = faceVertexOffset + static_cast<size_t>((faceVertexIndex + 1) % faceVertexCount);
+            const int pointIndex = mesh.faceVertexIndices[currentOffset];
+            const auto& point = points[pointIndex];
+            const auto& previousPoint = points[mesh.faceVertexIndices[previousOffset]];
+            const auto& nextPoint = points[mesh.faceVertexIndices[nextOffset]];
+            const auto previousEdge = previousPoint - point;
+            const auto nextEdge = nextPoint - point;
+            const float previousEdgeLengthSquared = previousEdge.GetLengthSq();
+            const float nextEdgeLengthSquared = nextEdge.GetLengthSq();
+            if (!std::isfinite(previousEdgeLengthSquared) || !std::isfinite(nextEdgeLengthSquared) || previousEdgeLengthSquared == 0.0f ||
+                nextEdgeLengthSquared == 0.0f)
+            {
+                continue;
+            }
+
+            const auto edgeCross = previousEdge ^ nextEdge;
+            float angle = std::atan2(edgeCross.GetLength(), previousEdge * nextEdge);
+            if ((edgeCross * faceNormal) > 0.0f)
+            {
+                angle = 2.0f * std::acos(-1.0f) - angle;
+            }
+            if (std::isfinite(angle))
+            {
+                accumulatedNormals[pointIndex] += faceNormal * angle;
+                neighborPositions[pointIndex].push_back(previousPoint);
+                neighborPositions[pointIndex].push_back(nextPoint);
+            }
+        }
+        faceVertexOffset += static_cast<size_t>(faceVertexCount);
+    }
+    if (faceVertexOffset != mesh.faceVertexIndices.size())
+    {
+        return false;
+    }
+
+    std::vector<size_t> sortedPointIndices(points.size());
+    std::iota(sortedPointIndices.begin(), sortedPointIndices.end(), 0);
+    std::sort(
+        sortedPointIndices.begin(),
+        sortedPointIndices.end(),
+        [&points](size_t leftIndex, size_t rightIndex)
+        {
+            const auto& left = points[leftIndex];
+            const auto& right = points[rightIndex];
+            for (size_t componentIndex = 0; componentIndex < 3; ++componentIndex)
+            {
+                if (left[componentIndex] != right[componentIndex])
+                {
+                    return left[componentIndex] < right[componentIndex];
+                }
+            }
+            return false;
+        }
+    );
+
+    smoothNormals.assign(points.size(), PXR_NS::GfVec3f(0.0f));
+    for (size_t groupStart = 0; groupStart < sortedPointIndices.size();)
+    {
+        size_t groupEnd = groupStart + 1;
+        const auto& position = points[sortedPointIndices[groupStart]];
+        while (groupEnd < sortedPointIndices.size() && points[sortedPointIndices[groupEnd]] == position)
+        {
+            ++groupEnd;
+        }
+
+        const size_t groupSize = groupEnd - groupStart;
+        std::vector<size_t> componentParents(groupSize);
+        std::iota(componentParents.begin(), componentParents.end(), 0);
+        const auto FindComponent = [&componentParents](size_t index)
+        {
+            while (componentParents[index] != index)
+            {
+                componentParents[index] = componentParents[componentParents[index]];
+                index = componentParents[index];
+            }
+            return index;
+        };
+        for (size_t left = 0; left < groupSize; ++left)
+        {
+            const size_t leftPointIndex = sortedPointIndices[groupStart + left];
+            for (size_t right = left + 1; right < groupSize; ++right)
+            {
+                const size_t rightPointIndex = sortedPointIndices[groupStart + right];
+                bool sharesEdge = false;
+                for (const auto& leftNeighbor : neighborPositions[leftPointIndex])
+                {
+                    if (std::find(neighborPositions[rightPointIndex].begin(), neighborPositions[rightPointIndex].end(), leftNeighbor) !=
+                        neighborPositions[rightPointIndex].end())
+                    {
+                        sharesEdge = true;
+                        break;
+                    }
+                }
+                const float leftLengthSquared = accumulatedNormals[leftPointIndex].GetLengthSq();
+                const float rightLengthSquared = accumulatedNormals[rightPointIndex].GetLengthSq();
+                constexpr float smoothingAngleCosine = -0.9961947f; // cos(175 degrees), matching Assimp's default.
+                const float compatibleNormalThreshold = smoothingAngleCosine * std::sqrt(leftLengthSquared * rightLengthSquared);
+                if (sharesEdge && accumulatedNormals[leftPointIndex] * accumulatedNormals[rightPointIndex] >= compatibleNormalThreshold)
+                {
+                    componentParents[FindComponent(right)] = FindComponent(left);
+                }
+            }
+        }
+
+        std::vector<PXR_NS::GfVec3f> componentNormals(groupSize, PXR_NS::GfVec3f(0.0f));
+        for (size_t groupIndex = 0; groupIndex < groupSize; ++groupIndex)
+        {
+            componentNormals[FindComponent(groupIndex)] += accumulatedNormals[sortedPointIndices[groupStart + groupIndex]];
+        }
+        for (size_t groupIndex = 0; groupIndex < groupSize; ++groupIndex)
+        {
+            auto normal = componentNormals[FindComponent(groupIndex)];
+            const float normalLengthSquared = normal.GetLengthSq();
+            if (std::isfinite(normalLengthSquared) && normalLengthSquared > 0.0f)
+            {
+                normal /= std::sqrt(normalLengthSquared);
+            }
+            smoothNormals[sortedPointIndices[groupStart + groupIndex]] = normal;
+        }
+        groupStart = groupEnd;
+    }
+    return true;
+}
 } // namespace
 
 bool StageUtils::CleanupMeshes(const StagePtr& stage, std::string& detailedError)
@@ -812,6 +1004,46 @@ bool StageUtils::CompactMeshPoints(const StagePtr& stage, const MeshPtr& mesh)
         return false;
     }
     return CompactMeshPointsAfterTopologyRepair(*stage, mesh);
+}
+
+bool StageUtils::GenerateSmoothNormals(const MeshPtr& mesh, bool replaceExistingNormals)
+{
+    if (!mesh)
+    {
+        return false;
+    }
+    if ((!replaceExistingNormals && !mesh->normals.empty()) || mesh->points.empty() || mesh->faceVertexCounts.empty() ||
+        mesh->faceVertexIndices.empty())
+    {
+        return true;
+    }
+
+    PXR_NS::VtVec3fArray smoothNormals;
+    if (!GenerateSmoothNormalsForPoints(*mesh, mesh->points, smoothNormals))
+    {
+        return false;
+    }
+
+    NormalCacheTimesamples normalCacheTimesamples;
+    normalCacheTimesamples.reserve(mesh->pointCacheTimesamples.size());
+    for (const auto& pointCacheFrame : mesh->pointCacheTimesamples)
+    {
+        if (pointCacheFrame.empty())
+        {
+            return false;
+        }
+        PXR_NS::VtVec3fArray frameNormals;
+        if (!GenerateSmoothNormalsForPoints(*mesh, pointCacheFrame, frameNormals))
+        {
+            return false;
+        }
+        normalCacheTimesamples.push_back(std::move(frameNormals));
+    }
+
+    mesh->normals = std::move(smoothNormals);
+    mesh->normalCacheTimesamples = std::move(normalCacheTimesamples);
+    mesh->hasFaceVaryingNormals = false;
+    return true;
 }
 
 void StageUtils::OptimizeMeshes(const StagePtr& stage)
@@ -931,7 +1163,12 @@ void StageUtils::OptimizeMeshes(const StagePtr& stage)
         PXR_NS::VtArray<int> newFaceVertexIndices;
         for (size_t j = 0; j < mesh->faceVertexIndices.size(); j++)
         {
-            size_t index = mesh->faceVertexIndices[j];
+            const int pointIndex = mesh->faceVertexIndices[j];
+            if (pointIndex < 0 || static_cast<size_t>(pointIndex) >= indexRemapping.size())
+            {
+                continue;
+            }
+            const size_t index = static_cast<size_t>(pointIndex);
             newFaceVertexIndices.push_back(indexRemapping[index]);
         }
     }
@@ -993,6 +1230,40 @@ void StageUtils::MergeMesh(const MeshPtr& targetMesh, const MeshPtr& srcMesh, co
 
     size_t targetFaceCount = targetMesh->faceVertexCounts.size();
     size_t targetPointsCount = targetMesh->points.size();
+    const size_t targetFaceVertexCount = targetMesh->faceVertexIndices.size();
+    const size_t srcFaceVertexCount = srcMesh->faceVertexIndices.size();
+
+    if (!targetMesh->pointCacheTimesamples.empty() || !srcMesh->pointCacheTimesamples.empty())
+    {
+        const size_t targetFrameCount = targetMesh->pointCacheTimesamples.size();
+        const size_t srcFrameCount = srcMesh->pointCacheTimesamples.size();
+        const size_t frameCount = std::max(targetFrameCount, srcFrameCount);
+        PointCacheTimesamples mergedPointCache;
+        mergedPointCache.reserve(frameCount);
+        for (size_t frameIndex = 0; frameIndex < frameCount; ++frameIndex)
+        {
+            const auto& targetFrame = targetFrameCount == 0 ? targetMesh->points :
+                                                              targetMesh->pointCacheTimesamples[std::min(frameIndex, targetFrameCount - 1)];
+            const auto& srcFrame = srcFrameCount == 0 ? srcMesh->points : srcMesh->pointCacheTimesamples[std::min(frameIndex, srcFrameCount - 1)];
+            const auto& validTargetFrame = targetFrame.size() == targetPointsCount ? targetFrame : targetMesh->points;
+            const auto& validSrcFrame = srcFrame.size() == srcMesh->points.size() ? srcFrame : srcMesh->points;
+
+            PointCacheFrame mergedFrame = validTargetFrame;
+            std::transform(
+                validSrcFrame.begin(),
+                validSrcFrame.end(),
+                std::back_inserter(mergedFrame),
+                [&srcTransform](const PXR_NS::GfVec3f& point)
+                {
+                    return PXR_NS::GfVec3f(srcTransform.Transform(point));
+                }
+            );
+            mergedPointCache.push_back(std::move(mergedFrame));
+        }
+        targetMesh->pointCacheTimesamples = std::move(mergedPointCache);
+        targetMesh->normalCacheTimesamples.clear();
+    }
+
     std::transform(
         srcMesh->points.begin(),
         srcMesh->points.end(),
@@ -1012,22 +1283,56 @@ void StageUtils::MergeMesh(const MeshPtr& targetMesh, const MeshPtr& srcMesh, co
         }
     );
 
-    if (targetPointsCount != 0 && (srcMesh->normals.empty() || targetMesh->normals.empty()))
+    if (srcMesh->normals.empty() || (targetPointsCount != 0 && targetMesh->normals.empty()))
     {
         targetMesh->normals.clear();
+        targetMesh->hasFaceVaryingNormals = false;
+    }
+    else if (targetFaceVertexCount == 0 && srcFaceVertexCount == 0)
+    {
+        const auto& invertTranspose = srcTransform.GetTranspose().GetInverse();
+        for (const auto& srcNormal : srcMesh->normals)
+        {
+            auto normal = PXR_NS::GfVec3f(invertTranspose.TransformDir(srcNormal));
+            const float normalLengthSquared = normal.GetLengthSq();
+            if (std::isfinite(normalLengthSquared) && normalLengthSquared > 0.0f)
+            {
+                normal /= std::sqrt(normalLengthSquared);
+            }
+            targetMesh->normals.push_back(normal);
+        }
+        targetMesh->hasFaceVaryingNormals = false;
     }
     else
     {
-        const auto& invertTranspose = srcTransform.GetTranspose().GetInverse();
-        std::transform(
-            srcMesh->normals.begin(),
-            srcMesh->normals.end(),
-            std::back_inserter(targetMesh->normals),
-            [&srcMesh, &invertTranspose](const PXR_NS::GfVec3f& normal)
+        const bool targetHasFaceVaryingNormals = targetMesh->hasFaceVaryingNormals || targetMesh->normals.size() != targetPointsCount;
+        if (targetPointsCount != 0 && !targetHasFaceVaryingNormals)
+        {
+            PXR_NS::VtVec3fArray expandedNormals;
+            expandedNormals.reserve(targetFaceVertexCount);
+            for (size_t faceVertexIndex = 0; faceVertexIndex < targetFaceVertexCount; ++faceVertexIndex)
             {
-                return PXR_NS::GfVec3f(invertTranspose.TransformDir(normal));
+                const int pointIndex = targetMesh->faceVertexIndices[faceVertexIndex];
+                expandedNormals.push_back(targetMesh->normals[pointIndex]);
             }
-        );
+            targetMesh->normals = std::move(expandedNormals);
+        }
+
+        const bool srcHasFaceVaryingNormals = srcMesh->hasFaceVaryingNormals || srcMesh->normals.size() != srcMesh->points.size();
+        const auto& invertTranspose = srcTransform.GetTranspose().GetInverse();
+        for (size_t faceVertexIndex = 0; faceVertexIndex < srcFaceVertexCount; ++faceVertexIndex)
+        {
+            const int pointIndex = srcMesh->faceVertexIndices[faceVertexIndex];
+            const size_t normalIndex = srcHasFaceVaryingNormals ? faceVertexIndex : static_cast<size_t>(pointIndex);
+            auto normal = PXR_NS::GfVec3f(invertTranspose.TransformDir(srcMesh->normals[normalIndex]));
+            const float normalLengthSquared = normal.GetLengthSq();
+            if (std::isfinite(normalLengthSquared) && normalLengthSquared > 0.0f)
+            {
+                normal /= std::sqrt(normalLengthSquared);
+            }
+            targetMesh->normals.push_back(normal);
+        }
+        targetMesh->hasFaceVaryingNormals = true;
     }
 
     size_t totalSrcFaceVertices = 0;
@@ -1153,89 +1458,183 @@ void StageUtils::MergeMesh(const MeshPtr& targetMesh, const MeshPtr& srcMesh, co
             }
         );
     }
+    // Baking a reflection changes handedness. Reverse the appended corners and
+    // their face-varying data together so normals, UVs, and colors stay attached.
+    if (srcTransform.GetDeterminant() < 0)
+    {
+        size_t begin = targetFaceVertexCount;
+        for (int count : srcMesh->faceVertexCounts)
+        {
+            const size_t end = begin + count;
+            auto reverseCorners = [&](auto& values)
+            {
+                if (values.size() == targetMesh->faceVertexIndices.size())
+                {
+                    std::reverse(values.begin() + begin, values.begin() + end);
+                }
+            };
+            reverseCorners(targetMesh->faceVertexIndices);
+            if (targetMesh->hasFaceVaryingNormals)
+            {
+                reverseCorners(targetMesh->normals);
+            }
+            for (auto& uv : targetMesh->uvs)
+            {
+                reverseCorners(uv);
+            }
+            for (auto& color : targetMesh->colors)
+            {
+                reverseCorners(color);
+            }
+            begin = end;
+        }
+    }
+}
+
+static void MergeMeshesWithSidedness(const StagePtr& stage, const std::string& mergedMeshName, bool doubleSided)
+{
+    if (stage->meshes.empty())
+    {
+        return;
+    }
+
+    const auto isClearedMesh = [](const MeshPtr& mesh)
+    {
+        return mesh->points.empty() && mesh->faceVertexCounts.empty() && mesh->faceVertexIndices.empty();
+    };
+
+    // Select each eligible mesh independently; unrelated animation or instancing must not
+    // prevent static siblings from being merged.
+    const size_t meshCount = stage->meshes.size();
+    std::vector<bool> eligible(meshCount, true);
+    std::vector<bool> skinned(meshCount, false);
+    std::vector<size_t> instanceCounts(meshCount, 0);
+    std::vector<StageNodePtr> instanceNodes(meshCount);
+    for (size_t i = 0; i < meshCount; ++i)
+    {
+        const auto& mesh = stage->meshes[i];
+        eligible[i] = mesh->doubleSided == doubleSided && !mesh->faceVertexIndices.empty() && mesh->pointCacheTimesamples.empty() &&
+                      mesh->normalCacheTimesamples.empty();
+    }
+    for (const auto& skinMesh : stage->skinMeshes)
+    {
+        eligible[skinMesh->meshIndex] = false;
+        skinned[skinMesh->meshIndex] = true;
+    }
+
+    StageUtils::TraverseStageTree(
+        stage->rootNode,
+        [&](const StageNodePtr& node)
+        {
+            auto& instances = node->staticMeshInstances;
+            instances.erase(
+                std::remove_if(
+                    instances.begin(),
+                    instances.end(),
+                    [&](size_t index)
+                    {
+                        return isClearedMesh(stage->meshes[index]);
+                    }
+                ),
+                instances.end()
+            );
+
+            auto ancestor = node;
+            while (ancestor && ancestor->transformAnimationTracks.empty())
+            {
+                ancestor = ancestor->parent.lock();
+            }
+            for (size_t index : instances)
+            {
+                ++instanceCounts[index];
+                instanceNodes[index] = node;
+                if (ancestor)
+                {
+                    eligible[index] = false;
+                }
+            }
+            return true;
+        }
+    );
+
+    size_t mergeCount = 0;
+    for (size_t i = 0; i < meshCount; ++i)
+    {
+        eligible[i] = eligible[i] && instanceCounts[i] == 1;
+        mergeCount += eligible[i];
+    }
+    if (mergeCount < 2)
+    {
+        return;
+    }
+
+    auto mergedMesh = std::make_shared<Mesh>();
+    mergedMesh->name = mergedMeshName;
+    mergedMesh->doubleSided = doubleSided;
+    std::vector<MeshPtr> retainedMeshes;
+    std::vector<size_t> remappedIndices(meshCount);
+    for (size_t i = 0; i < meshCount; ++i)
+    {
+        if (eligible[i])
+        {
+            StageUtils::MergeMesh(mergedMesh, stage->meshes[i], instanceNodes[i]->worldTransformMatrix);
+        }
+        else if (!isClearedMesh(stage->meshes[i]) || skinned[i])
+        {
+            remappedIndices[i] = retainedMeshes.size();
+            retainedMeshes.push_back(stage->meshes[i]);
+        }
+    }
+
+    // Preserve all non-merged instances and skin references when compacting the mesh table.
+    StageUtils::TraverseStageTree(
+        stage->rootNode,
+        [&](const StageNodePtr& node)
+        {
+            auto& instances = node->staticMeshInstances;
+            instances.erase(
+                std::remove_if(
+                    instances.begin(),
+                    instances.end(),
+                    [&](size_t index)
+                    {
+                        return eligible[index];
+                    }
+                ),
+                instances.end()
+            );
+            for (auto& index : instances)
+            {
+                index = remappedIndices[index];
+            }
+            return true;
+        }
+    );
+    for (const auto& skinMesh : stage->skinMeshes)
+    {
+        skinMesh->meshIndex = remappedIndices[skinMesh->meshIndex];
+    }
+    stage->rootNode->staticMeshInstances.push_back(retainedMeshes.size());
+    retainedMeshes.push_back(mergedMesh);
+    stage->meshes = std::move(retainedMeshes);
 }
 
 void StageUtils::MergeMeshes(const StagePtr& stage, const std::string& mergedMeshName)
 {
-    if (stage->meshes.size() == 0)
-    {
-        return;
-    }
-
-    for (size_t i = 0; i < stage->meshes.size(); i++)
-    {
-        for (auto& skinMesh : stage->skinMeshes)
+    // Most scenes are entirely single-sided; avoid a second tree traversal for them.
+    const bool hasDoubleSided = std::any_of(
+        stage->meshes.begin(),
+        stage->meshes.end(),
+        [](const MeshPtr& mesh)
         {
-            if (skinMesh->meshIndex == i)
-            {
-                return;
-            }
-        }
-    }
-
-    std::unordered_map<MeshPtr, StageNodePtr> meshInstanceNodes;
-    bool stop = false;
-    TraverseStageTree(
-        stage->rootNode,
-        [&stage, &stop, &meshInstanceNodes](const StageNodePtr& stageNode)
-        {
-            for (size_t i = 0; i < stageNode->staticMeshInstances.size(); i++)
-            {
-                size_t meshIndex = stageNode->staticMeshInstances[i];
-                auto mesh = stage->meshes[meshIndex];
-                auto iter = meshInstanceNodes.find(mesh);
-                if (iter == meshInstanceNodes.end())
-                {
-                    meshInstanceNodes.insert({ mesh, stageNode });
-                }
-                else
-                {
-                    stop = true;
-                    break;
-                }
-            }
-
-            return !stop;
+            return mesh->doubleSided;
         }
     );
-
-    if (stop || meshInstanceNodes.empty())
+    MergeMeshesWithSidedness(stage, mergedMeshName, false);
+    if (hasDoubleSided)
     {
-        return;
+        MergeMeshesWithSidedness(stage, mergedMeshName + "_double_sided", true);
     }
-
-    // If it has any animations on top of mesh nodes, skipping the merge.
-    for (const auto& meshNodePair : meshInstanceNodes)
-    {
-        auto parentNode = meshNodePair.second;
-
-        while (parentNode && parentNode->transformAnimationTracks.empty())
-        {
-            parentNode = parentNode->parent.lock();
-        }
-
-        if (parentNode)
-        {
-            return;
-        }
-    }
-
-    // Merge all mesh instances.
-    auto mergedMesh = std::make_shared<Mesh>();
-    mergedMesh->name = mergedMeshName;
-    for (const auto& meshNodePair : meshInstanceNodes)
-    {
-        StageUtils::MergeMesh(mergedMesh, meshNodePair.first, meshNodePair.second->worldTransformMatrix);
-    }
-    stage->meshes = { mergedMesh };
-
-    // Clear all instances, and put the merged mesh to the first instance node.
-    for (const auto& meshNodePair : meshInstanceNodes)
-    {
-        meshNodePair.second->staticMeshInstances.clear();
-    }
-
-    stage->rootNode->staticMeshInstances.push_back(0);
 }
 
 void StageUtils::TraverseStageTree(const StageNodePtr& stageNode, OnStageNodePreCallback callback, OnStageNodePostCallback endNodeCallback)

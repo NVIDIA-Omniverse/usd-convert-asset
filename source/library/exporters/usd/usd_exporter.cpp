@@ -4,12 +4,14 @@
 #include "usd_exporter.h"
 
 #include "../../common/common.h"
+#include "../../utils/unicode.h"
 #include "../../utils/utils.h"
 
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <stack>
+#include <stdexcept>
 #include <unordered_map>
 
 #define ENSURE_STATUS_OK(status)                                                                                                                     \
@@ -20,6 +22,17 @@
             return res;                                                                                                                              \
         }                                                                                                                                            \
     }
+
+static void ValidateOutputPath(const std::string& path)
+{
+#ifdef _WIN32
+    if (!PXR_NS::SdfLayer::IsAnonymousLayerIdentifier(path) &&
+        (Unicode::convert(path).size() >= 260 || Unicode::convert(PathUtils::AbsPath(path)).size() >= 260))
+    {
+        throw std::runtime_error("Output or supporting-file path exceeds the Windows path limit: " + path);
+    }
+#endif
+}
 
 const static std::string MATERIAL_DIR_NAME = "materials";
 const static std::string MESH_DIR_NAME = "props";
@@ -556,10 +569,6 @@ static bool GetValidMeshNormals(
             if (std::isfinite(normalLengthSquared) && normalLengthSquared > 1e-12f)
             {
                 normal /= std::sqrt(normalLengthSquared);
-                if (hasFaceNormal && normal * faceNormal < 0.0f)
-                {
-                    normal = -normal;
-                }
             }
             else
             {
@@ -851,6 +860,7 @@ PXR_NS::SdfVariantSpecHandle AddVariant(PXR_NS::SdfPrimSpecHandle defaultPrimSpe
 } // namespace
 
 OmniConverterStatus UsdExporter::Export(const StagePtr& stage, std::string& detailedError)
+try
 {
     Log("Starting to export asset with USD exporter.");
     mExportedCurveIndices.clear();
@@ -896,6 +906,7 @@ OmniConverterStatus UsdExporter::Export(const StagePtr& stage, std::string& deta
             }
             else
             {
+                mExportContext->SetTemporaryOutputDirectory(tempExportRoot);
                 Log("Temp folder created to host all temp files: " + tempExportRoot);
             }
         }
@@ -993,6 +1004,13 @@ OmniConverterStatus UsdExporter::Export(const StagePtr& stage, std::string& deta
     return status;
 }
 
+catch (const std::runtime_error& error)
+{
+    detailedError = error.what();
+    Log(detailedError);
+    return OmniConverterStatus::FILE_WRITE_ERROR;
+}
+
 OmniConverterStatus UsdExporter::WriteLayerTo(PXR_NS::SdfLayerRefPtr layer, const std::string& path, std::string& detailedError)
 {
     if (mExportContext->IsExited())
@@ -1028,6 +1046,7 @@ OmniConverterStatus UsdExporter::WriteLayerTo(PXR_NS::SdfLayerRefPtr layer, cons
 
 PXR_NS::SdfLayerRefPtr UsdExporter::GetOrCreateLayer(const std::string& realStagePath, bool yAxis, double unit)
 {
+    ValidateOutputPath(realStagePath);
     PXR_NS::SdfLayerRefPtr targetLayer;
 
     auto iter = mLayerHolders.find(realStagePath);
@@ -1046,7 +1065,7 @@ PXR_NS::SdfLayerRefPtr UsdExporter::GetOrCreateLayer(const std::string& realStag
 
         if (!targetLayer)
         {
-            return nullptr;
+            throw std::runtime_error("Cannot create output layer: " + realStagePath);
         }
 
         mLayerHolders[realStagePath] = targetLayer;
@@ -1097,6 +1116,7 @@ PXR_NS::SdfLayerRefPtr UsdExporter::GetOrCreateLayer(const std::string& realStag
 
 std::string UsdExporter::ReserveUniqueUploadPath(const std::string& targetPath)
 {
+    ValidateOutputPath(targetPath);
     if (mUploadedTargetPaths.insert(StringUtils::ToLower(targetPath)).second)
     {
         return targetPath;
@@ -1114,6 +1134,7 @@ std::string UsdExporter::ReserveUniqueUploadPath(const std::string& targetPath)
         }
 
         std::string uniquePath = PathUtils::JoinPaths(directory, fileName);
+        ValidateOutputPath(uniquePath);
         if (mUploadedTargetPaths.insert(StringUtils::ToLower(uniquePath)).second)
         {
             return uniquePath;
@@ -1495,7 +1516,9 @@ OmniConverterStatus UsdExporter::ExportTextures(const StagePtr& stage, std::stri
                 return OmniConverterStatus::CANCELLED;
             }
 
-            Log("Skips texture " + std::to_string(index) + " and uses material values.");
+            const std::string& texturePath = texture->realPath.empty() ? texture->originalPath : texture->realPath;
+            Log("Warning: The source material references texture '" + texturePath +
+                "', but the texture could not be resolved or copied. The output omits the texture and uses constant material values.");
             for (const auto& material : stage->materials)
             {
                 for (size_t type = (size_t)MaterialTextureType::START; type < (size_t)MaterialTextureType::END; ++type)
@@ -1608,6 +1631,130 @@ OmniConverterStatus UsdExporter::ExportStageTree(const StagePtr& stage, std::str
     return OmniConverterStatus::OK;
 }
 
+// USD stores one value per joint at every authored time. Bones can finish at different
+// fractional times, so sample their shared timeline instead of aligning values by index.
+struct SkeletalAnimationSamples
+{
+    std::vector<StageNodePtr> bones;
+    std::vector<double> translationTimes, scaleTimes, rotationTimes;
+    std::vector<PXR_NS::VtVec3dArray> translations, scales;
+    std::vector<PXR_NS::VtQuatdArray> rotations;
+};
+
+static PXR_NS::GfVec3d InterpolateBoneSample(double alpha, const PXR_NS::GfVec3d& a, const PXR_NS::GfVec3d& b)
+{
+    return (1.0 - alpha) * a + alpha * b;
+}
+
+static PXR_NS::GfQuatd InterpolateBoneSample(double alpha, const PXR_NS::GfQuatd& a, const PXR_NS::GfQuatd& b)
+{
+    return PXR_NS::GfSlerp(alpha, a, b);
+}
+
+template <typename T>
+static T SampleBoneChannel(const TransformTimesamples& samples, const PXR_NS::VtArray<T>& values, TransformChannel channel, double time, const T& rest)
+{
+    if (values.empty())
+    {
+        return rest;
+    }
+    if (time <= samples.GetSampleTime(0, channel))
+    {
+        return values.front();
+    }
+    if (time >= samples.GetSampleTime(values.size() - 1, channel))
+    {
+        return values.back();
+    }
+    size_t lower = 0, upper = values.size() - 1;
+    while (upper - lower > 1)
+    {
+        const size_t middle = lower + (upper - lower) / 2;
+        if (samples.GetSampleTime(middle, channel) <= time)
+        {
+            lower = middle;
+        }
+        else
+        {
+            upper = middle;
+        }
+    }
+    const double start = samples.GetSampleTime(lower, channel);
+    const double end = samples.GetSampleTime(upper, channel);
+    return InterpolateBoneSample((time - start) / (end - start), values[lower], values[upper]);
+}
+
+static SkeletalAnimationSamples GatherSkeletalAnimationSamples(const StageNodePtr& rootBone, size_t trackIndex)
+{
+    SkeletalAnimationSamples result;
+    const auto appendTimes = [](std::vector<double>& times, const TransformTimesamples& samples, TransformChannel channel, size_t count)
+    {
+        for (size_t i = 0; i < count; ++i)
+        {
+            times.push_back(samples.GetSampleTime(i, channel));
+        }
+    };
+    StageUtils::TraverseStageTree(
+        rootBone,
+        [&](const StageNodePtr& bone)
+        {
+            if (!bone->isBoneNode)
+            {
+                return false;
+            }
+            result.bones.push_back(bone);
+            if (trackIndex < bone->transformAnimationTracks.size())
+            {
+                const auto& samples = bone->transformAnimationTracks[trackIndex];
+                appendTimes(result.translationTimes, samples, TransformChannel::Translation, samples.GetTranslationSamples().size());
+                appendTimes(result.scaleTimes, samples, TransformChannel::Scale, samples.GetScaleSamples().size());
+                appendTimes(result.rotationTimes, samples, TransformChannel::Rotation, samples.GetOrientSamples().size());
+            }
+            return true;
+        }
+    );
+    if (result.translationTimes.empty() && result.scaleTimes.empty() && result.rotationTimes.empty())
+    {
+        return result;
+    }
+    for (auto* times : { &result.translationTimes, &result.scaleTimes, &result.rotationTimes })
+    {
+        // Unanimated channels still need the rest pose when another channel moves.
+        if (times->empty())
+        {
+            times->push_back(0.0);
+        }
+        std::sort(times->begin(), times->end());
+        times->erase(std::unique(times->begin(), times->end()), times->end());
+    }
+    result.translations.resize(result.translationTimes.size());
+    result.scales.resize(result.scaleTimes.size());
+    result.rotations.resize(result.rotationTimes.size());
+    const TransformTimesamples emptySamples;
+    for (const auto& bone : result.bones)
+    {
+        const auto rest = MathUtils::GfMatrixToTQS(bone->useOrderForAnimation ? bone->orderTransform : bone->restTransform);
+        const auto& samples = trackIndex < bone->transformAnimationTracks.size() ? bone->transformAnimationTracks[trackIndex] : emptySamples;
+        for (size_t i = 0; i < result.translationTimes.size(); ++i)
+        {
+            result.translations[i].push_back(
+                SampleBoneChannel(samples, samples.GetTranslationSamples(), TransformChannel::Translation, result.translationTimes[i], rest.t)
+            );
+        }
+        for (size_t i = 0; i < result.scaleTimes.size(); ++i)
+        {
+            result.scales[i].push_back(SampleBoneChannel(samples, samples.GetScaleSamples(), TransformChannel::Scale, result.scaleTimes[i], rest.s));
+        }
+        for (size_t i = 0; i < result.rotationTimes.size(); ++i)
+        {
+            result.rotations[i].push_back(
+                SampleBoneChannel(samples, samples.GetOrientSamples(), TransformChannel::Rotation, result.rotationTimes[i], rest.q)
+            );
+        }
+    }
+    return result;
+}
+
 OmniConverterStatus UsdExporter::ExportAnimationClip(const StagePtr& stage, std::string& detailedError)
 {
     const auto& animationTrack = stage->animationTracks[0];
@@ -1629,135 +1776,12 @@ OmniConverterStatus UsdExporter::ExportAnimationClip(const StagePtr& stage, std:
         }
     );
 
+    const auto samples = GatherSkeletalAnimationSamples(rootBone, 0);
     PXR_NS::VtTokenArray joints;
-    size_t maxTranslationFrames = 0;
-    size_t maxScalingFrames = 0;
-    size_t maxOrientsFrames = 0;
-
-    // Get stats to avoid exporting redudant frames
-    StageUtils::TraverseStageTree(
-        rootBone,
-        [&maxTranslationFrames, &maxScalingFrames, &maxOrientsFrames](const StageNodePtr& bone)
-        {
-            if (!bone->isBoneNode)
-            {
-                return false;
-            }
-
-            if (bone->transformAnimationTracks.size() > 0)
-            {
-                const auto& transformSamples = bone->transformAnimationTracks[0];
-                maxTranslationFrames = std::max(transformSamples.GetTranslationSamples().size(), maxTranslationFrames);
-                maxScalingFrames = std::max(transformSamples.GetScaleSamples().size(), maxScalingFrames);
-                maxOrientsFrames = std::max(transformSamples.GetOrientSamples().size(), maxOrientsFrames);
-            }
-
-            return true;
-        }
-    );
-
-    if (maxTranslationFrames > 0 || maxScalingFrames > 0 || maxOrientsFrames > 0)
+    for (const auto& bone : samples.bones)
     {
-        // FIXME: If any of TRS is animated, the others must have at least one frame data.
-        maxTranslationFrames = std::max(maxTranslationFrames, (size_t)1);
-        maxScalingFrames = std::max(maxScalingFrames, (size_t)1);
-        maxOrientsFrames = std::max(maxOrientsFrames, (size_t)1);
+        joints.push_back(PXR_NS::TfToken(mStageNodeInfos[bone].jointName));
     }
-
-    std::vector<PXR_NS::VtVec3dArray> allBoneTranslationSamples(maxTranslationFrames);
-    std::vector<PXR_NS::VtVec3dArray> allBoneScaleSamples(maxScalingFrames);
-    std::vector<PXR_NS::VtQuatdArray> allBoneRotationSamples(maxOrientsFrames);
-
-    StageUtils::TraverseStageTree(
-        rootBone,
-        [&](const StageNodePtr& bone)
-        {
-            if (!bone->isBoneNode)
-            {
-                return false;
-            }
-
-            joints.push_back(PXR_NS::TfToken(mStageNodeInfos[bone].jointName));
-
-            auto boneRestTQS = MathUtils::GfMatrixToTQS(bone->restTransform);
-            if (bone->useOrderForAnimation)
-            {
-                boneRestTQS = MathUtils::GfMatrixToTQS(bone->orderTransform);
-            }
-            PXR_NS::VtVec3dArray translations;
-            PXR_NS::VtVec3dArray scalings;
-            PXR_NS::VtQuatdArray orients;
-            if (bone->transformAnimationTracks.size() > 0)
-            {
-                const auto& transformTimesamples = bone->transformAnimationTracks[0];
-                translations = transformTimesamples.GetTranslationSamples();
-                scalings = transformTimesamples.GetScaleSamples();
-                orients = transformTimesamples.GetOrientSamples();
-            }
-
-            if (translations.size() > 0)
-            {
-                for (size_t j = 0; j < translations.size(); j++)
-                {
-                    allBoneTranslationSamples[j].push_back(translations[j]);
-                }
-
-                for (size_t j = translations.size(); j < maxTranslationFrames; j++)
-                {
-                    allBoneTranslationSamples[j].push_back(translations.back());
-                }
-            }
-            else
-            {
-                for (size_t j = 0; j < maxTranslationFrames; j++)
-                {
-                    allBoneTranslationSamples[j].push_back(boneRestTQS.t);
-                }
-            }
-
-            if (scalings.size() > 0)
-            {
-                for (size_t j = 0; j < scalings.size(); j++)
-                {
-                    allBoneScaleSamples[j].push_back(scalings[j]);
-                }
-
-                for (size_t j = scalings.size(); j < maxScalingFrames; j++)
-                {
-                    allBoneScaleSamples[j].push_back(scalings.back());
-                }
-            }
-            else
-            {
-                for (size_t j = 0; j < maxScalingFrames; j++)
-                {
-                    allBoneScaleSamples[j].push_back(boneRestTQS.s);
-                }
-            }
-
-            if (orients.size() > 0)
-            {
-                for (size_t j = 0; j < orients.size(); j++)
-                {
-                    allBoneRotationSamples[j].push_back(orients[j]);
-                }
-
-                for (size_t j = orients.size(); j < maxOrientsFrames; j++)
-                {
-                    allBoneRotationSamples[j].push_back(orients.back());
-                }
-            }
-            else
-            {
-                for (size_t j = 0; j < maxOrientsFrames; j++)
-                {
-                    allBoneRotationSamples[j].push_back(boneRestTQS.q);
-                }
-            }
-
-            return true;
-        }
-    );
 
     auto jointsAttrSpec = CreateAndSetAttrSpec(
         animation,
@@ -1773,16 +1797,16 @@ OmniConverterStatus UsdExporter::ExportAnimationClip(const StagePtr& stage, std:
         PXR_NS::SdfValueTypeNames->Half3Array,
         PXR_NS::SdfVariabilityVarying
     );
-    for (size_t i = 0; i < maxScalingFrames; i++)
+    for (size_t i = 0; i < samples.scaleTimes.size(); i++)
     {
         PXR_NS::VtVec3hArray s;
-        const auto& scaleSamples = allBoneScaleSamples[i];
+        const auto& scaleSamples = samples.scales[i];
         s.reserve(scaleSamples.size());
         for (const auto& scale : scaleSamples)
         {
             s.push_back(PXR_NS::GfVec3h(scale));
         }
-        usdLayer->SetTimeSample(scalesAttrSpec->GetPath(), static_cast<double>(i / stage->mutiplier), PXR_NS::VtValue(s));
+        usdLayer->SetTimeSample(scalesAttrSpec->GetPath(), samples.scaleTimes[i] * 24.0 / animationTrack.fps, PXR_NS::VtValue(s));
     }
 
     auto rotationsAttrSpec = GetOrNewSdfAttributeSpec(
@@ -1791,16 +1815,16 @@ OmniConverterStatus UsdExporter::ExportAnimationClip(const StagePtr& stage, std:
         PXR_NS::SdfValueTypeNames->QuatfArray,
         PXR_NS::SdfVariabilityVarying
     );
-    for (size_t i = 0; i < maxOrientsFrames; i++)
+    for (size_t i = 0; i < samples.rotationTimes.size(); i++)
     {
-        const auto& orientsSamples = allBoneRotationSamples[i];
+        const auto& orientsSamples = samples.rotations[i];
         PXR_NS::VtQuatfArray q;
         q.reserve(orientsSamples.size());
         for (const auto& orient : orientsSamples)
         {
             q.push_back(PXR_NS::GfQuatf(orient));
         }
-        usdLayer->SetTimeSample(rotationsAttrSpec->GetPath(), static_cast<double>(i / stage->mutiplier), PXR_NS::VtValue(q));
+        usdLayer->SetTimeSample(rotationsAttrSpec->GetPath(), samples.rotationTimes[i] * 24.0 / animationTrack.fps, PXR_NS::VtValue(q));
     }
 
     auto translationsAttrSpec = GetOrNewSdfAttributeSpec(
@@ -1809,16 +1833,16 @@ OmniConverterStatus UsdExporter::ExportAnimationClip(const StagePtr& stage, std:
         PXR_NS::SdfValueTypeNames->Float3Array,
         PXR_NS::SdfVariabilityVarying
     );
-    for (size_t i = 0; i < maxTranslationFrames; i++)
+    for (size_t i = 0; i < samples.translationTimes.size(); i++)
     {
         PXR_NS::VtVec3fArray t;
-        const auto& translationSamples = allBoneTranslationSamples[i];
+        const auto& translationSamples = samples.translations[i];
         t.reserve(translationSamples.size());
         for (const auto& translation : translationSamples)
         {
             t.push_back(PXR_NS::GfVec3f(translation));
         }
-        usdLayer->SetTimeSample(translationsAttrSpec->GetPath(), static_cast<double>(i / stage->mutiplier), PXR_NS::VtValue(t));
+        usdLayer->SetTimeSample(translationsAttrSpec->GetPath(), samples.translationTimes[i] * 24.0 / animationTrack.fps, PXR_NS::VtValue(t));
     }
 
     return WriteLayerTo(usdLayer, mExportContext->converterContext.GetOutputAssetPath(), detailedError);
@@ -2424,6 +2448,16 @@ PXR_NS::SdfPrimSpecHandle UsdExporter::ExportMeshInternal(
     }
 
     usdMeshSpec = GetOrCreatePrimSpec(usdLayer, meshPath, PXR_NS::_tokens->mesh, true, meshDisplayName);
+    if (mesh->doubleSided)
+    {
+        CreateAndSetAttrSpec(
+            usdMeshSpec,
+            PXR_NS::UsdGeomTokens->doubleSided,
+            PXR_NS::SdfValueTypeNames->Bool,
+            PXR_NS::VtValue(true),
+            PXR_NS::SdfVariabilityUniform
+        );
+    }
     auto subdivisionAttrSpec = CreateAndSetAttrSpec(
         usdMeshSpec,
         PXR_NS::UsdGeomTokens->subdivisionScheme,
@@ -2648,7 +2682,23 @@ OmniConverterStatus UsdExporter::ExportAnimations(const StagePtr& stage, std::st
     if (stage->maxKeyFrames > 0)
     {
         mainLayer->SetStartTimeCode(0);
-        mainLayer->SetEndTimeCode(stage->maxKeyFrames / stage->mutiplier);
+        double endTime = stage->maxKeyFrames / stage->mutiplier;
+        if (!stage->animationTracks.empty())
+        {
+            endTime = 0.0;
+            for (const auto& track : stage->animationTracks)
+            {
+                // Older importers provide a frame count instead of an explicit duration.
+                const double duration = track.duration >= 0.0 ? track.duration : static_cast<double>(track.keyFrames);
+                endTime = std::max(endTime, duration * 24.0 / track.fps);
+            }
+        }
+        // Vertex animation caches still use the stage-wide sample rate and can outlast the transform tracks.
+        for (const auto& mesh : stage->meshes)
+        {
+            endTime = std::max(endTime, mesh->pointCacheTimesamples.size() / stage->mutiplier);
+        }
+        mainLayer->SetEndTimeCode(endTime);
     }
 
     // TEMP: Enable fractional cutout settings for Kit
@@ -2733,7 +2783,7 @@ OmniConverterStatus UsdExporter::ExportAnimations(const StagePtr& stage, std::st
                     if (transforms.Size() > 0)
                     {
                         auto xformPrim = GetOrCreatePrimSpec(mainLayer, editNamespacePrimPath, PXR_NS::TfToken(), false);
-                        SetXformTransformSamples(xformPrim, transforms, useDoublePrecisionOps, stageNode->useTES, stage);
+                        SetXformTransformSamples(xformPrim, transforms, useDoublePrecisionOps, stageNode->useTES, animationTrack);
                     }
                 }
 
@@ -2806,144 +2856,19 @@ OmniConverterStatus UsdExporter::ExportAnimations(const StagePtr& stage, std::st
 
                             const PXR_NS::SdfPath& editNamespacePrimPath = ToEditNamespacePath(usdCameraSpec->GetPath());
                             auto cameraPrimSpec = GetOrCreatePrimSpec(mainLayer, editNamespacePrimPath, PXR_NS::TfToken(), false);
-                            SetXformTransformSamples(cameraPrimSpec, transformTimesamples, useDoublePrecisionOps, stageNode->useTES, stage);
+                            SetXformTransformSamples(cameraPrimSpec, transformTimesamples, useDoublePrecisionOps, stageNode->useTES, animationTrack);
                         }
                     }
                 }
 
                 if (stageNode->IsRootBone())
                 {
+                    const auto samples = GatherSkeletalAnimationSamples(stageNode, trackIndex);
                     PXR_NS::VtTokenArray joints;
-                    size_t maxTranslationFrames = 0;
-                    size_t maxScalingFrames = 0;
-                    size_t maxOrientsFrames = 0;
-
-                    // Get stats to avoid exporting redudant frames
-                    StageUtils::TraverseStageTree(
-                        stageNode,
-                        [&maxTranslationFrames, &maxScalingFrames, &maxOrientsFrames, trackIndex](const StageNodePtr& bone)
-                        {
-                            if (!bone->isBoneNode)
-                            {
-                                return false;
-                            }
-
-                            if (trackIndex < bone->transformAnimationTracks.size())
-                            {
-                                const auto& transformSamples = bone->transformAnimationTracks[trackIndex];
-                                maxTranslationFrames = std::max(transformSamples.GetTranslationSamples().size(), maxTranslationFrames);
-                                maxScalingFrames = std::max(transformSamples.GetScaleSamples().size(), maxScalingFrames);
-                                maxOrientsFrames = std::max(transformSamples.GetOrientSamples().size(), maxOrientsFrames);
-                            }
-
-                            return true;
-                        }
-                    );
-
-                    if (maxTranslationFrames > 0 || maxScalingFrames > 0 || maxOrientsFrames > 0)
+                    for (const auto& bone : samples.bones)
                     {
-                        // FIXME: If any of TRS is animated, the others must have at least one frame data.
-                        maxTranslationFrames = std::max(maxTranslationFrames, (size_t)1);
-                        maxScalingFrames = std::max(maxScalingFrames, (size_t)1);
-                        maxOrientsFrames = std::max(maxOrientsFrames, (size_t)1);
+                        joints.push_back(PXR_NS::TfToken(mStageNodeInfos[bone].jointName));
                     }
-
-                    // Traverse bone tree to populate all transform data.
-                    std::vector<PXR_NS::VtVec3dArray> allBoneTranslationSamples(maxTranslationFrames);
-                    std::vector<PXR_NS::VtVec3dArray> allBoneScaleSamples(maxScalingFrames);
-                    std::vector<PXR_NS::VtQuatdArray> allBoneRotationSamples(maxOrientsFrames);
-                    StageUtils::TraverseStageTree(
-                        stageNode,
-                        [&](const StageNodePtr& bone)
-                        {
-                            if (!bone->isBoneNode)
-                            {
-                                return false;
-                            }
-                            auto name = std::string(bone->name);
-                            bool condition = (name.find("R_FINGER") != std::string::npos) && (name.find("537") != std::string::npos);
-
-                            joints.push_back(PXR_NS::TfToken(mStageNodeInfos[bone].jointName));
-
-                            auto boneRestTQS = MathUtils::GfMatrixToTQS(bone->restTransform);
-                            if (bone->useOrderForAnimation)
-                            {
-                                boneRestTQS = MathUtils::GfMatrixToTQS(bone->orderTransform);
-                            }
-                            PXR_NS::VtVec3dArray translations;
-                            PXR_NS::VtVec3dArray scalings;
-                            PXR_NS::VtQuatdArray orients;
-                            if (trackIndex < bone->transformAnimationTracks.size())
-                            {
-                                const auto& transformTimesamples = bone->transformAnimationTracks[trackIndex];
-                                translations = transformTimesamples.GetTranslationSamples();
-                                scalings = transformTimesamples.GetScaleSamples();
-                                orients = transformTimesamples.GetOrientSamples();
-                            }
-
-                            if (translations.size() > 0)
-                            {
-                                for (size_t j = 0; j < translations.size(); j++)
-                                {
-                                    allBoneTranslationSamples[j].push_back(translations[j]);
-                                }
-
-                                for (size_t j = translations.size(); j < maxTranslationFrames; j++)
-                                {
-                                    allBoneTranslationSamples[j].push_back(translations.back());
-                                }
-                            }
-                            else
-                            {
-                                for (size_t j = 0; j < maxTranslationFrames; j++)
-                                {
-                                    allBoneTranslationSamples[j].push_back(boneRestTQS.t);
-                                }
-                            }
-
-                            if (scalings.size() > 0)
-                            {
-                                for (size_t j = 0; j < scalings.size(); j++)
-                                {
-                                    allBoneScaleSamples[j].push_back(scalings[j]);
-                                }
-
-                                for (size_t j = scalings.size(); j < maxScalingFrames; j++)
-                                {
-                                    allBoneScaleSamples[j].push_back(scalings.back());
-                                }
-                            }
-                            else
-                            {
-                                for (size_t j = 0; j < maxScalingFrames; j++)
-                                {
-                                    allBoneScaleSamples[j].push_back(boneRestTQS.s);
-                                }
-                            }
-
-                            if (orients.size() > 0)
-                            {
-                                for (size_t j = 0; j < orients.size(); j++)
-                                {
-                                    allBoneRotationSamples[j].push_back(orients[j]);
-                                }
-
-                                for (size_t j = orients.size(); j < maxOrientsFrames; j++)
-                                {
-                                    allBoneRotationSamples[j].push_back(orients.back());
-                                }
-                            }
-                            else
-                            {
-                                for (size_t j = 0; j < maxOrientsFrames; j++)
-                                {
-                                    allBoneRotationSamples[j].push_back(boneRestTQS.q);
-                                }
-                            }
-
-                            return true;
-                        }
-                    );
 
                     // Authoring animation data into animation layer.
                     if (!animationLayer)
@@ -2990,16 +2915,17 @@ OmniConverterStatus UsdExporter::ExportAnimations(const StagePtr& stage, std::st
                         PXR_NS::SdfValueTypeNames->Half3Array,
                         PXR_NS::SdfVariabilityVarying
                     );
-                    for (size_t i = 0; i < maxScalingFrames; i++)
+                    for (size_t i = 0; i < samples.scaleTimes.size(); i++)
                     {
                         PXR_NS::VtVec3hArray s;
-                        const auto& scaleSamples = allBoneScaleSamples[i];
+                        const auto& scaleSamples = samples.scales[i];
                         s.reserve(scaleSamples.size());
                         for (const auto& scale : scaleSamples)
                         {
                             s.push_back(PXR_NS::GfVec3h(scale));
                         }
-                        animationLayer->SetTimeSample(scalesAttrSpec->GetPath(), static_cast<double>(i / stage->mutiplier), PXR_NS::VtValue(s));
+                        animationLayer
+                            ->SetTimeSample(scalesAttrSpec->GetPath(), samples.scaleTimes[i] * 24.0 / animationTrack.fps, PXR_NS::VtValue(s));
                     }
 
                     auto rotationsAttrSpec = GetOrNewSdfAttributeSpec(
@@ -3008,16 +2934,17 @@ OmniConverterStatus UsdExporter::ExportAnimations(const StagePtr& stage, std::st
                         PXR_NS::SdfValueTypeNames->QuatfArray,
                         PXR_NS::SdfVariabilityVarying
                     );
-                    for (size_t i = 0; i < maxOrientsFrames; i++)
+                    for (size_t i = 0; i < samples.rotationTimes.size(); i++)
                     {
-                        const auto& orientsSamples = allBoneRotationSamples[i];
+                        const auto& orientsSamples = samples.rotations[i];
                         PXR_NS::VtQuatfArray q;
                         q.reserve(orientsSamples.size());
                         for (const auto& orient : orientsSamples)
                         {
                             q.push_back(PXR_NS::GfQuatf(orient));
                         }
-                        animationLayer->SetTimeSample(rotationsAttrSpec->GetPath(), static_cast<double>(i / stage->mutiplier), PXR_NS::VtValue(q));
+                        animationLayer
+                            ->SetTimeSample(rotationsAttrSpec->GetPath(), samples.rotationTimes[i] * 24.0 / animationTrack.fps, PXR_NS::VtValue(q));
                     }
 
                     auto translationsAttrSpec = GetOrNewSdfAttributeSpec(
@@ -3026,16 +2953,20 @@ OmniConverterStatus UsdExporter::ExportAnimations(const StagePtr& stage, std::st
                         PXR_NS::SdfValueTypeNames->Float3Array,
                         PXR_NS::SdfVariabilityVarying
                     );
-                    for (size_t i = 0; i < maxTranslationFrames; i++)
+                    for (size_t i = 0; i < samples.translationTimes.size(); i++)
                     {
                         PXR_NS::VtVec3fArray t;
-                        const auto& translationSamples = allBoneTranslationSamples[i];
+                        const auto& translationSamples = samples.translations[i];
                         t.reserve(translationSamples.size());
                         for (const auto& translation : translationSamples)
                         {
                             t.push_back(PXR_NS::GfVec3f(translation));
                         }
-                        animationLayer->SetTimeSample(translationsAttrSpec->GetPath(), static_cast<double>(i / stage->mutiplier), PXR_NS::VtValue(t));
+                        animationLayer->SetTimeSample(
+                            translationsAttrSpec->GetPath(),
+                            samples.translationTimes[i] * 24.0 / animationTrack.fps,
+                            PXR_NS::VtValue(t)
+                        );
                     }
 
                     // Authoring variants to bind different animation source if it has multiple tracks.
@@ -3091,7 +3022,7 @@ void UsdExporter::ExportPreviewSurfaceNode(
     const PXR_NS::TfToken UsdPreviewSurfaceID("UsdPreviewSurface");
     CreateShadeSpecType(usdShader, PXR_NS::UsdShadeTokens->infoId, PXR_NS::SdfValueTypeNames->Token, PXR_NS::VtValue(UsdPreviewSurfaceID));
 
-    CreateShadeSpecInput(usdShader, "ior", PXR_NS::SdfValueTypeNames->Float, PXR_NS::VtValue(1.5f));
+    CreateShadeSpecInput(usdShader, "ior", PXR_NS::SdfValueTypeNames->Float, PXR_NS::VtValue(material->ior));
     CreateShadeSpecInput(usdShader, "displacement", PXR_NS::SdfValueTypeNames->Float, PXR_NS::VtValue(0.0f));
     CreateShadeSpecInput(usdShader, "occlusion", PXR_NS::SdfValueTypeNames->Float, PXR_NS::VtValue(1.0f));
     CreateShadeSpecInput(
@@ -3108,7 +3039,8 @@ void UsdExporter::ExportPreviewSurfaceNode(
 
     if (!ExportPreviewSurfaceTextureNode(stage, usdLayer, materialPrim, usdShader, material, MaterialTextureType::EMISSIVE, "emmissiveTex"))
     {
-        CreateShadeSpecInput(usdShader, "emissiveColor", PXR_NS::SdfValueTypeNames->Color3f, PXR_NS::VtValue(material->emissiveColor));
+        const float strength = material->hasEmissiveStrength ? material->emissiveStrength : 1.0f;
+        CreateShadeSpecInput(usdShader, "emissiveColor", PXR_NS::SdfValueTypeNames->Color3f, PXR_NS::VtValue(material->emissiveColor * strength));
     }
 
     if (!ExportPreviewSurfaceTextureNode(stage, usdLayer, materialPrim, usdShader, material, MaterialTextureType::NORMAL, "normalTex"))
@@ -3249,7 +3181,7 @@ bool UsdExporter::ExportPreviewSurfaceTextureNode(
         PXR_NS::VtValue(PXR_NS::_tokens->usdPrimvarReaderFloat2)
     );
 
-    CreateShadeSpecInput(stReaderSpec, "varname", PXR_NS::SdfValueTypeNames->Token, PXR_NS::VtValue(PXR_NS::_tokens->st));
+    CreateShadeSpecInput(stReaderSpec, "varname", PXR_NS::SdfValueTypeNames->String, PXR_NS::VtValue(texSet));
     CreateShadeSpecOutput(stReaderSpec, "result", PXR_NS::SdfValueTypeNames->Float2);
 
     static auto wrapModeToString = [](const TextureWrapMode& wrapMode)
@@ -3274,7 +3206,8 @@ bool UsdExporter::ExportPreviewSurfaceTextureNode(
 
     PXR_NS::SdfAttributeSpecHandle input;
     std::string outputChannels;
-    PXR_NS::SdfValueTypeName valueType;
+    PXR_NS::SdfValueTypeName outputValueType;
+    PXR_NS::SdfValueTypeName inputValueType;
     static const std::string color[int(MaterialTextureType::END)] = {
         "diffuseColor", "emissiveColor", "opacity",  "normal",    "specularColor",      "roughness",
         "occlusion",    "roughness",     "metallic", "clearcoat", "clearcoatRoughness", "" // No clearcoatnormal
@@ -3304,6 +3237,16 @@ bool UsdExporter::ExportPreviewSurfaceTextureNode(
         scale = textureReference.scale;
         bias = textureReference.bias;
     }
+    if (type == MaterialTextureType::EMISSIVE && material->hasEmissiveColor)
+    {
+        const float strength = material->hasEmissiveStrength ? material->emissiveStrength : 1.0f;
+        for (size_t channel = 0; channel < 3; ++channel)
+        {
+            const float factor = material->emissiveColor[channel] * strength;
+            scale[channel] *= factor;
+            bias[channel] *= factor;
+        }
+    }
     CreateShadeSpecInput(fileShaderSpec, "scale", PXR_NS::SdfValueTypeNames->Float4, PXR_NS::VtValue(scale));
     CreateShadeSpecInput(fileShaderSpec, "bias", PXR_NS::SdfValueTypeNames->Float4, PXR_NS::VtValue(bias));
 
@@ -3326,7 +3269,8 @@ bool UsdExporter::ExportPreviewSurfaceTextureNode(
         type == MaterialTextureType::NORMAL)
     {
         outputChannels = "rgb";
-        valueType = PXR_NS::SdfValueTypeNames->Float3;
+        outputValueType = PXR_NS::SdfValueTypeNames->Float3;
+        inputValueType = type == MaterialTextureType::NORMAL ? PXR_NS::SdfValueTypeNames->Normal3f : PXR_NS::SdfValueTypeNames->Color3f;
     }
     else if (type == MaterialTextureType::OPACITY)
     {
@@ -3338,43 +3282,49 @@ bool UsdExporter::ExportPreviewSurfaceTextureNode(
         {
             outputChannels = "a";
         }
-        valueType = PXR_NS::SdfValueTypeNames->Float;
+        outputValueType = PXR_NS::SdfValueTypeNames->Float;
+        inputValueType = PXR_NS::SdfValueTypeNames->Float;
     }
     else if (type == MaterialTextureType::METALLIC)
     {
         outputChannels = "b";
-        valueType = PXR_NS::SdfValueTypeNames->Float;
+        outputValueType = PXR_NS::SdfValueTypeNames->Float;
+        inputValueType = PXR_NS::SdfValueTypeNames->Float;
         CreateShadeSpecOutput(fileShaderSpec, outputChannels, PXR_NS::SdfValueTypeNames->Float);
         input = CreateShadeSpecInput(usdShader, color[int(type)], PXR_NS::SdfValueTypeNames->Float);
     }
     else if (type == MaterialTextureType::OCCLUSION)
     {
         outputChannels = "r";
-        valueType = PXR_NS::SdfValueTypeNames->Float;
+        outputValueType = PXR_NS::SdfValueTypeNames->Float;
+        inputValueType = PXR_NS::SdfValueTypeNames->Float;
     }
     else if (type == MaterialTextureType::GLOSSY)
     {
         outputChannels = "a";
-        valueType = PXR_NS::SdfValueTypeNames->Float;
+        outputValueType = PXR_NS::SdfValueTypeNames->Float;
+        inputValueType = PXR_NS::SdfValueTypeNames->Float;
     }
     else if (type == MaterialTextureType::ROUGHNESS)
     {
         outputChannels = "g";
-        valueType = PXR_NS::SdfValueTypeNames->Float;
+        outputValueType = PXR_NS::SdfValueTypeNames->Float;
+        inputValueType = PXR_NS::SdfValueTypeNames->Float;
     }
     else if (type == MaterialTextureType::CLEARCOAT || type == MaterialTextureType::CLEARCOAT_ROUGHNESS)
     {
         outputChannels = "r";
-        valueType = PXR_NS::SdfValueTypeNames->Float;
+        outputValueType = PXR_NS::SdfValueTypeNames->Float;
+        inputValueType = PXR_NS::SdfValueTypeNames->Float;
     }
 
-    CreateShadeSpecOutput(fileShaderSpec, outputChannels, valueType);
+    CreateShadeSpecOutput(fileShaderSpec, outputChannels, outputValueType);
     if (outputChannels != "rgb")
     {
         CreateShadeSpecOutput(fileShaderSpec, "rgb", PXR_NS::SdfValueTypeNames->Float3);
     }
 
-    input = CreateShadeSpecInput(usdShader, color[int(type)], valueType);
+    input = CreateShadeSpecInput(usdShader, color[int(type)], inputValueType);
     auto outputChannelSpec = CreateShadeSpecOutput(fileShaderSpec, outputChannels.c_str(), PXR_NS::SdfValueTypeNames->Token);
     Usd_InsertListItem(input->GetConnectionPathList(), outputChannelSpec->GetPath(), true);
 
@@ -3397,7 +3347,7 @@ bool UsdExporter::ExportPreviewSurfaceTextureNode(
     CreateShadeSpecInput(uvTransformSpec, "translation", PXR_NS::SdfValueTypeNames->Float2, PXR_NS::VtValue(textureReference.transform.translation));
     CreateShadeSpecOutput(uvTransformSpec, "result", PXR_NS::SdfValueTypeNames->Float2);
 
-    auto texSetInput = CreateShadeSpecInput(fileShaderSpec, texSet, PXR_NS::SdfValueTypeNames->Float2);
+    auto texSetInput = CreateShadeSpecInput(fileShaderSpec, "st", PXR_NS::SdfValueTypeNames->Float2);
     auto resultuvTransformOutput = CreateShadeSpecOutput(uvTransformSpec, "result", PXR_NS::SdfValueTypeNames->Token);
     Usd_InsertListItem(texSetInput->GetConnectionPathList(), resultuvTransformOutput->GetPath(), true);
 
@@ -3555,7 +3505,7 @@ void UsdExporter::SetXformTransformSamples(
     const TransformTimesamples& transformTimesamples,
     bool useDoublePrecisionOps,
     bool useTESOps,
-    const StagePtr& stage
+    const AnimationTrack& animationTrack
 )
 {
     if (!transformTimesamples.Empty())
@@ -3563,13 +3513,25 @@ void UsdExporter::SetXformTransformSamples(
         const auto& translationSamples = transformTimesamples.GetTranslationSamples();
         for (size_t i = 0; i < translationSamples.size(); i++)
         {
-            SetTranslateSample(xformPrimSpec, translationSamples[i], PXR_NS::UsdTimeCode(i / stage->mutiplier), useDoublePrecisionOps, false);
+            SetTranslateSample(
+                xformPrimSpec,
+                translationSamples[i],
+                PXR_NS::UsdTimeCode(transformTimesamples.GetSampleTime(i, TransformChannel::Translation) * 24.0 / animationTrack.fps),
+                useDoublePrecisionOps,
+                false
+            );
         }
 
         const auto& scaleSamples = transformTimesamples.GetScaleSamples();
         for (size_t i = 0; i < scaleSamples.size(); i++)
         {
-            SetScaleSample(xformPrimSpec, scaleSamples[i], PXR_NS::UsdTimeCode(i / stage->mutiplier), useDoublePrecisionOps, false);
+            SetScaleSample(
+                xformPrimSpec,
+                scaleSamples[i],
+                PXR_NS::UsdTimeCode(transformTimesamples.GetSampleTime(i, TransformChannel::Scale) * 24.0 / animationTrack.fps),
+                useDoublePrecisionOps,
+                false
+            );
         }
 
         if (useTESOps)
@@ -3577,7 +3539,13 @@ void UsdExporter::SetXformTransformSamples(
             const auto& rotationSamples = transformTimesamples.GetRotationXYZSamples();
             for (size_t i = 0; i < rotationSamples.size(); i++)
             {
-                SetRotateXYZSample(xformPrimSpec, rotationSamples[i], PXR_NS::UsdTimeCode(i / stage->mutiplier), useDoublePrecisionOps, false);
+                SetRotateXYZSample(
+                    xformPrimSpec,
+                    rotationSamples[i],
+                    PXR_NS::UsdTimeCode(transformTimesamples.GetSampleTime(i, TransformChannel::Rotation) * 24.0 / animationTrack.fps),
+                    useDoublePrecisionOps,
+                    false
+                );
             }
         }
         else
@@ -3585,7 +3553,13 @@ void UsdExporter::SetXformTransformSamples(
             const auto& rotationSamples = transformTimesamples.GetOrientSamples();
             for (size_t i = 0; i < rotationSamples.size(); i++)
             {
-                SetOrientSample(xformPrimSpec, rotationSamples[i], PXR_NS::UsdTimeCode(i / stage->mutiplier), useDoublePrecisionOps, false);
+                SetOrientSample(
+                    xformPrimSpec,
+                    rotationSamples[i],
+                    PXR_NS::UsdTimeCode(transformTimesamples.GetSampleTime(i, TransformChannel::Rotation) * 24.0 / animationTrack.fps),
+                    useDoublePrecisionOps,
+                    false
+                );
             }
         }
     }

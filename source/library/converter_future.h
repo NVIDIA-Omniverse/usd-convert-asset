@@ -10,6 +10,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 struct OmniConverterFuture
 {
@@ -30,6 +31,10 @@ public:
         void IncrementProgress(uint32_t steps = 1);
         void FinishProgress();
         bool IsExited();
+        void SetTemporaryOutputDirectory(const std::string& path);
+        std::string GetTemporaryOutputDirectory();
+        void SetCallbackError(const std::string& error);
+        std::string GetCallbackError();
 
         OmniConverterContext converterContext;
 
@@ -39,13 +44,15 @@ public:
         OmniConverterStatus GetStatus();
 
         void SetDetailedError(const std::string& error);
-        const std::string& GetDetailedError();
+        std::string GetDetailedError();
 
         void Exit();
 
         std::mutex mStatusMutex;
         OmniConverterStatus mCurrentStatus = OmniConverterStatus::OK;
         std::string mDetailedError;
+        std::string mTemporaryOutputDirectory;
+        std::string mCallbackError;
 
         OmniConverterFuture* mThisFuture = nullptr;
         uint32_t mCurrentProgress = 0;
@@ -66,14 +73,22 @@ public:
 
     void Start();
     void Stop();
+    void Wait();
+    void Release();
     OmniConverterStatus GetStatus() const;
     const std::string& GetDetailedError() const;
+    void SetCallbackError(const std::string& error);
+    void SetTemporaryOutputDirectory(const std::string& path);
+    std::string GetTemporaryOutputDirectory() const;
 
 private:
 
     static void Convert(std::shared_ptr<FutureThreadContext> context);
 
     std::shared_ptr<FutureThreadContext> mContext;
+    std::thread mThread;
+    mutable std::mutex mDetailedErrorSnapshotsMutex;
+    mutable std::vector<std::unique_ptr<std::string>> mDetailedErrorSnapshots;
 };
 
 typedef std::shared_ptr<OmniConverterFuture::FutureThreadContext> OmniFutureThreadContextPtr;

@@ -56,8 +56,9 @@ Keep CLI examples, README snippets, and smoke tests aligned when flags, entry po
 
 1. Do not import native bindings from `usd_convert_asset.__init__`; package import should stay lightweight.
 2. Keep both entry points working when CLI behavior changes: `usd-convert-asset` and `python -m usd_convert_asset`.
-3. For source-build or wheel-staging changes, account for platform-specific native runtime libraries and plugin resources.
-4. Do not commit machine-local Autodesk FBX SDK paths or accept Autodesk license terms on behalf of the user.
+3. Preserve public CLI flag names and meanings when documentation can resolve an agent-selection ambiguity. Do not remove, rename, or replace a public flag without an approved breaking-change plan and a major-version increment.
+4. For source-build or wheel-staging changes, account for platform-specific native runtime libraries and plugin resources.
+5. Do not commit machine-local Autodesk FBX SDK paths or accept Autodesk license terms on behalf of the user.
 
 ## Verification
 

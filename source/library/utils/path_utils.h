@@ -59,6 +59,15 @@ public:
     // Rename path.
     static bool Rename(const std::string& from, const std::string& to);
 
+    // Check whether an output path contains a reserved platform path component.
+    static bool ValidateOutputPath(const std::string& path, std::string& error);
+
+    // Check whether output replacement can preserve the destination without opening it.
+    static bool CheckOutputReplaceable(const std::string& path, std::string& error);
+
+    // Replace a regular, writable file or create a new file through an atomic rename.
+    static bool ReplaceOutputFile(const std::string& from, const std::string& to);
+
     // Remove path.
     static bool RemoveAll(const std::string& path);
 

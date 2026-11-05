@@ -24,9 +24,9 @@ public:
 
 private:
 
-    OmniConverterStatus ExportTextures(const StagePtr& stage);
-    OmniConverterStatus UploadTextureIfNotEmpty(const TextureImagePtr& texture);
-    OmniConverterStatus UploadFileInternal(const std::string& filePath, const std::string& targetDir);
+    OmniConverterStatus ExportTextures(const StagePtr& stage, std::string& detailedError);
+    OmniConverterStatus UploadTextureIfNotEmpty(const TextureImagePtr& texture, std::string& detailedError);
+    OmniConverterStatus UploadFileInternal(const std::string& filePath, const std::string& targetDir, std::string& detailedError);
 
     fbxsdk::FbxSurfaceMaterial* ToFbxMaterial(const StagePtr& stage, fbxsdk::FbxScene* fbxScene, const MaterialPtr& material);
     fbxsdk::FbxCamera* ToFbxCamera(fbxsdk::FbxScene* fbxScene, const CameraPtr& camera);
@@ -38,11 +38,8 @@ private:
     void PreprocessStage(const StagePtr& stage);
     void SetDefaultTransform(fbxsdk::FbxNode* node, const Transform& transform);
     void SetDefaultMatrix(fbxsdk::FbxNode* node, const PXR_NS::GfMatrix4d& transform);
-    void SetTimeSampledTranslation(fbxsdk::FbxNode* node, fbxsdk::FbxAnimLayer* animLayer, fbxsdk::FbxTime time, const PXR_NS::GfVec3d& sample);
-    void SetTimeSampledScale(fbxsdk::FbxNode* node, fbxsdk::FbxAnimLayer* animLayer, fbxsdk::FbxTime time, const PXR_NS::GfVec3d& sample);
-    void SetTimeSampledRotationXYZ(fbxsdk::FbxNode* node, fbxsdk::FbxAnimLayer* animLayer, fbxsdk::FbxTime time, const PXR_NS::GfVec3d& sample);
     void SetNodeTRSSamples(
-        const StagePtr& stage,
+        double samplesPerSecond,
         fbxsdk::FbxNode* node,
         fbxsdk::FbxAnimLayer* animLayer,
         const TransformTimesamples& transformTimesamples

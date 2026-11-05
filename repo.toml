@@ -34,6 +34,7 @@ msbuild.vs_version = "" #leave empty to use latest version on local machine
 
 # Disable licensing gathering for Conan pip package since we already have its license in third party licenses
 fetch.pip.licensing_enabled = false
+fetch.pip.ignore_pip_cache_failure = true
 
 
 fetch.before_pull_commands = [

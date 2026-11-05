@@ -16,7 +16,7 @@ public:
 private:
 
     void Log(const std::string& message);
-    void PopulateAllMeshes(StagePtr& stage, tinygltf::Model& model, double scale = 1.0);
+    bool PopulateAllMeshes(StagePtr& stage, tinygltf::Model& model, double scale, std::string& detailedError);
     void PopulateAllMaterials(StagePtr& stage, tinygltf::Model& model);
     void PopulateAllCameras(StagePtr& stage, tinygltf::Model& model, double scale = 1.0);
     void PopulateAllLights(StagePtr& stage, tinygltf::Model& model, double scale = 1.0);

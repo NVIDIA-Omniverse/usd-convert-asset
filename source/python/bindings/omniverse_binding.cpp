@@ -101,7 +101,8 @@ public:
         gAllocatedBuffers[blob->buffer] = mBuffer;
         blob->deleter = [](void* buffer)
         {
-            // Release python buffer
+            // Native workers can release Python-owned input buffers.
+            py::gil_scoped_acquire gil;
             gAllocatedBuffers.erase(buffer);
         };
     }
@@ -1317,12 +1318,16 @@ PYBIND11_MODULE(_assetconverter, m)
                 }
                 catch (py::error_already_set& e)
                 {
+                    const std::string error = "Material loader callback failed: " + std::string(e.what());
+                    omniConverterSetFutureCallbackError(future, error.c_str());
                     CallPythonLogCallback(e.what());
                     return false;
                 }
                 catch (...)
                 {
-                    CallPythonLogCallback("Failed to load material because of unknown error.");
+                    const char* error = "Material loader callback failed because of an unknown error.";
+                    omniConverterSetFutureCallbackError(future, error);
+                    CallPythonLogCallback(error);
                     return false;
                 }
 
@@ -1344,8 +1349,8 @@ PYBIND11_MODULE(_assetconverter, m)
     EXPORT_FUNCTION(omniConverterCreateAsset);
     EXPORT_FUNCTION(omniConverterCheckFutureStatus);
     EXPORT_FUNCTION(omniConverterGetFutureDetailedError);
-    EXPORT_FUNCTION(omniConverterCancelFuture);
-    EXPORT_FUNCTION(omniConverterReleaseFuture);
+    m.def("omniConverterCancelFuture", &omniConverterCancelFuture, py::call_guard<py::gil_scoped_release>());
+    m.def("omniConverterReleaseFuture", &omniConverterReleaseFuture, py::call_guard<py::gil_scoped_release>());
     EXPORT_FUNCTION(omniConverterSetCacheFolder);
 
     m.def(

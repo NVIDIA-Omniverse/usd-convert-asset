@@ -17,6 +17,34 @@ dedicated virtual environment and run conversion in a separate process. Invoke
 `usd-convert-asset` as a subprocess or use its CLI without importing both
 runtimes into one process.
 
+## Conversion Results and Limitations
+
+A successful conversion does not guarantee that every source element was preserved.
+Review conversion warnings as well as the result status and output file. For
+supported partial-conversion cases, the converter skips damaged or unsupported
+elements and keeps the content it can convert. For example, invalid vertex values
+can cause a glTF primitive or affected OBJ/PLY geometry to be skipped while valid
+geometry remains. Conversion fails when no valid geometry remains; supported PLY
+point clouds can be preserved without faces. Other errors can still fail conversion.
+
+A custom Python `material_loader` callback that raises an exception causes the
+conversion to report failure instead of silently substituting fallback materials.
+Check the conversion result and logs before using the output.
+
+On Linux aarch64, FBX conversion uses Assimp rather than Autodesk FBX SDK. FBX
+skin bindings and lights are not preserved on import; animation and skin bindings
+are not preserved on export. Static bind-pose geometry can be retained without
+preserving an editable skeleton or its animation. Warnings identify unsupported
+content; validate the result on the target platform. Windows x86_64 and Linux
+x86_64 use Autodesk FBX SDK and additionally support FBX NURBS curve preservation.
+
+## Python Multiprocessing
+
+On POSIX systems, do not fork while a conversion or its cleanup is active. After
+using the converter, use the `spawn` or `forkserver` multiprocessing start method
+to start further processes. Create converters within the worker process rather
+than sharing active converter objects between processes.
+
 ## Building From Source
 
 Run the normal repo build first. This compiles `asset_converter_native_bindings`,
@@ -43,10 +71,6 @@ Linux aarch64:
 ./repo.sh build --config release
 ./repo.sh uv -- build _build/linux-aarch64/release/pip/usd_convert_asset -o dist
 ```
-
-The Linux aarch64 wheel converts FBX through Assimp. Windows x86_64 and Linux
-x86_64 use Autodesk FBX SDK and additionally support FBX NURBS curve
-preservation.
 
 The wheel is written to `dist/`:
 
@@ -88,7 +112,9 @@ usd-convert-asset -i path/to/input.fbx -o path/to/output.usdz
 .venv/bin/python -m usd_convert_asset -i path/to/input.obj -o path/to/output.usdc
 ```
 
-USDZ output enables USD Preview Surface automatically when materials are exported.
+When materials are exported, the converter authors USD Preview Surface materials for all supported USD output formats.
+
+UsdPreviewSurface inputs use the types defined by the UsdPreviewSurface specification: `color3f` for color inputs and `normal3f` for the normal. Scripts that create or compare texture-connected inputs previously typed as `float3` must use these types; the values are unchanged.
 Use `--ignore-materials` to create a geometry-only USDZ package.
 
 To test the staged tree before building a wheel, replace the wheel install with
@@ -102,7 +128,7 @@ Use the matching `_build/<platform>/<config>/pip/usd_convert_asset` path
 for the platform and configuration you built. Replace the input paths with
 existing source assets and the output paths with writable locations. Run
 `usd-convert-asset --help` for conversion flags such as `--single-props-file`,
-`--ignore-materials`, `--fbx-y-up`, and `--progress`.
+`--ignore-materials`, `--fbx-y-up`, `--fbx-z-up`, and `--progress`.
 
 ## License
 
@@ -110,7 +136,7 @@ This package is licensed under the Apache License, Version 2.0 and the Creative
 Commons Attribution 4.0 International Public License. See `LICENSE`.
 
 Third-party notices and generated dependency license attributions are included
-in `PACKAGE-LICENSES`.
+in `PACKAGE-LICENSES` in the source archive. Installed wheels store the main license and third-party notices under their own `.dist-info/licenses/` directory.
 
 ## Uninstalling
 

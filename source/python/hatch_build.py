@@ -6,16 +6,22 @@ from __future__ import annotations
 import platform
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 
 GLIBC_VERSION_RE = re.compile(r"^(?P<major>\d+)[._](?P<minor>\d+)$")
+NON_RUNTIME_BUILD_ARTIFACT_SUFFIXES = frozenset({".exp", ".ilk", ".lib", ".pdb"})
 
 
 class CustomHook(BuildHookInterface):
     def initialize(self, version: str, build_data: dict) -> None:
+        if sys.version_info[:2] != (3, 12):
+            raise RuntimeError(
+                f"usd-convert-asset wheels must be built with Python 3.12; got {sys.version_info.major}.{sys.version_info.minor}"
+            )
         build_data["pure_python"] = False
         # Only Linux wheels carry a manylinux tag, so only require/validate the glibc baseline
         # there. On Windows repo.tokens.abi is intentionally empty, which would otherwise fail
@@ -67,15 +73,40 @@ class CustomHook(BuildHookInterface):
         native_source_dir = package_root.parent.parent / "python" / "asset_converter_native_bindings"
         native_target_dir = package_root / "asset_converter_native_bindings"
 
-        if not native_source_dir.is_dir():
+        if native_source_dir.is_dir():
+            self._copy_tree(native_source_dir, native_target_dir)
+        else:
             # uv may run this hook from an unpacked sdist. The original build
             # output is not there, so use the native bindings already bundled
             # in the sdist.
-            if native_target_dir.is_dir():
-                return
-            raise FileNotFoundError(f"Native bindings source directory is missing: source:{native_source_dir}")
+            if not native_target_dir.is_dir():
+                raise FileNotFoundError(f"Native bindings source directory is missing: source:{native_source_dir}")
 
-        self._copy_tree(native_source_dir, native_target_dir)
+        self._remove_non_runtime_build_artifacts(native_target_dir)
+        if sys.platform == "linux":
+            self._drop_libpython(native_target_dir)
+
+    @staticmethod
+    def _drop_libpython(native_dir: Path) -> None:
+        # Python symbols must come from the host interpreter. Delete any libpython left in
+        # staging by an earlier build, and remove the libpython DT_NEEDED entry that the
+        # bindings and prebuilt OpenUSD libraries carry so the loader doesn't look for it.
+        for stale in native_dir.rglob("libpython*"):
+            stale.unlink()
+
+        libpython = f"libpython{sys.version_info.major}.{sys.version_info.minor}.so.1.0"
+        for lib in native_dir.rglob("*.so*"):
+            if lib.is_file() and not lib.is_symlink():
+                subprocess.run(["patchelf", "--remove-needed", libpython, str(lib)], check=True)
+
+    @staticmethod
+    def _remove_non_runtime_build_artifacts(native_dir: Path) -> None:
+        for artifact_path in native_dir.rglob("*"):
+            if artifact_path.is_file() and artifact_path.suffix.lower() in NON_RUNTIME_BUILD_ARTIFACT_SUFFIXES:
+                try:
+                    artifact_path.unlink()
+                except PermissionError as exc:
+                    raise PermissionError(f"Could not remove non-runtime build artifact: {artifact_path}") from exc
 
     def _copy_tree(self, source_dir: Path, target_dir: Path) -> None:
         for source_path in source_dir.rglob("*"):

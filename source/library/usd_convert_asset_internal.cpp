@@ -14,6 +14,12 @@ const static std::unordered_map<std::string, AssetType> gExtensionAssetMap = {
     { "ply", AssetType::PLY },   { "lxo", AssetType::LXO },   { "md5", AssetType::MD5 },
 };
 
+static bool IsRemoteUrl(const std::string& path)
+{
+    const auto scheme = PathUtils::GetUrlScheme(path);
+    return scheme.size() > 1 && path.compare(scheme.size(), 3, "://") == 0;
+}
+
 static AssetType FileFormatToAssetType(const PXR_NS::SdfFileFormatConstPtr& fileFormat)
 {
     auto formatId = fileFormat->GetFormatId();
@@ -255,6 +261,30 @@ bool OmniConverterContext::MakeDirectories(const std::string& directory) const
     }
 
     return mCallbacks.makeDirsCallback(directory.c_str());
+}
+
+bool OmniConverterContext::ValidateOutputPath(std::string& error) const
+{
+    // Custom storage and anonymous layers retain their own path semantics.
+    const auto& output = GetOutputAssetPath();
+    const bool usesDefaultWriter = IsOutputAssetUsdcOrUsdaOrUsdz() ? mCallbacks.usesDefaultLayerWriter : mCallbacks.usesDefaultBinaryWriter;
+    if (!usesDefaultWriter || IsInMemoryOutput() || IsRemoteUrl(output))
+    {
+        return true;
+    }
+    return PathUtils::ValidateOutputPath(output, error);
+}
+
+bool OmniConverterContext::CheckOutputReplaceable(std::string& error) const
+{
+    // Custom storage and anonymous layers retain their own write semantics.
+    const auto& output = GetOutputAssetPath();
+    const bool usesDefaultWriter = IsOutputAssetUsdcOrUsdaOrUsdz() ? mCallbacks.usesDefaultLayerWriter : mCallbacks.usesDefaultBinaryWriter;
+    if (!usesDefaultWriter || IsInMemoryOutput() || IsRemoteUrl(output))
+    {
+        return true;
+    }
+    return PathUtils::CheckOutputReplaceable(output, error);
 }
 
 OmniConverterBlobPtr OmniConverterContext::ReadFile(const std::string& path) const

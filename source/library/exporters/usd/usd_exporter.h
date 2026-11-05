@@ -146,7 +146,7 @@ private:
         const TransformTimesamples& transformTimesamples,
         bool useDoublePrecisionOps,
         bool useTESOps,
-        const StagePtr& stage
+        const AnimationTrack& animationTrack
     );
 
     void BindMaterialToPrimFromSubset(

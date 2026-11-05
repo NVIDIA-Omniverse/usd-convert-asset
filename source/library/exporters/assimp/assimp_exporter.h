@@ -32,7 +32,7 @@ private:
     aiTexture* ToAiTexture(const TextureImagePtr& texture);
     std::vector<aiMesh*> ToAiMesh(const MeshPtr& mesh);
     std::shared_ptr<aiScene> ToAiScene(const StagePtr& stage, std::string& detailedError);
-    void AddDummyMaterialForSTL(aiScene* assimpScene);
+    void AddDefaultMaterialIfEmpty(aiScene* assimpScene);
     void PopulateStageNodeTree(const StagePtr& stage, const StageNodePtr& currentNode, aiNode** parentAssimpNode = nullptr);
     void PreprocessAllNodes(const StagePtr& stage, const StageNodePtr& node);
 
@@ -60,4 +60,6 @@ private:
     // it will be splitted into several parts. This map is used to record
     // all the meshes that's splitted from original mesh.
     std::unordered_map<MeshPtr, std::vector<size_t>> mMeshIndices;
+    // OBJ bakes node transforms, so mirrored instances need their own winding.
+    std::unordered_map<MeshPtr, std::vector<size_t>> mMirroredMeshIndices;
 };

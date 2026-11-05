@@ -15,13 +15,15 @@ __all__ = ["convert", "assetconverter", "AsyncTestCase"]
 IS_LINUX_AARCH64 = platform.system() == "Linux" and platform.machine().lower() in ("aarch64", "arm64")
 
 
-async def convert(input_path, output_path, material_loader):
+async def convert(input_path, output_path, material_loader, smooth_normals=False, preview_surface=False):
     try:
         async with assetconverter.OmniAssetConverter(
             input_path,
             output_path,
             material_loader=material_loader,
             single_mesh=True,
+            smooth_normals=smooth_normals,
+            preview_surface=preview_surface,
             keep_all_materials=True,
             use_double_precision_to_usd_transform_op=True,
             ignore_pivots=True,
@@ -62,7 +64,7 @@ class AsyncTestCase(unittest.IsolatedAsyncioTestCase):
             assetconverter.OmniAssetConverter.set_cache_folder("")
             assetconverter.OmniAssetConverter.set_log_callback(None)
 
-    def assertIsValidUsd(self, identifier, validate_geometry=True):
+    def assertIsValidUsd(self, identifier, validate_geometry=True, validate_normal_winding=True):
         # skip asset validation on linux-aarch64 for now as those runners take much longer to run
         if IS_LINUX_AARCH64:
             return
@@ -75,6 +77,8 @@ class AsyncTestCase(unittest.IsolatedAsyncioTestCase):
 
         if not validate_geometry:
             validation_engine.disable_rule(usd_validation_nvidia.ExtentsChecker)
+
+        if not validate_geometry or not validate_normal_winding:
             validation_engine.disable_rule(usd_validation_nvidia.NormalsWindingsChecker)
 
         result = validation_engine.validate(identifier)

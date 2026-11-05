@@ -84,75 +84,76 @@ OmniConverterStatus FbxSdkExporter::Export(const StagePtr& stage, std::string& d
     uint32_t totalSteps = GetTotalExportSteps(stage);
     mExportContext->StartProgress(totalSteps);
 
-    ENSURE_STATUS_OK(ExportTextures(stage));
+    ENSURE_STATUS_OK(ExportTextures(stage, detailedError));
     PreprocessStage(stage);
 
-    std::lock_guard<std::mutex> lock(gFbxManagerLock);
-    auto manager = FbxManagerCreator();
-    auto ioSettings = FbxSettingsCreator(manager.get(), IOSROOT);
-    manager->SetIOSettings(ioSettings.get());
-
-    auto fbxScene = ToFbxScene(manager.get(), stage);
-    if (!fbxScene || mExportContext->IsExited())
-    {
-        return OmniConverterStatus::CANCELLED;
-    }
-
-    FbxDocumentInfo* sceneInfo = FbxDocumentInfo::Create(manager.get(), "SceneInfo");
-    sceneInfo->mTitle = "Omniverse Converter";
-    sceneInfo->mSubject = "usd-convert-asset";
-    sceneInfo->mAuthor = "NVIDIA Omniverse";
-    sceneInfo->mRevision = "6.0";
-    sceneInfo->mKeywords = "USD to FBX, Omniverse";
-    sceneInfo->mComment = "This asset is converted from USD.";
-    fbxScene->SetSceneInfo(sceneInfo);
-    if (stage->yAxis)
-    {
-        fbxScene->GetGlobalSettings().SetAxisSystem(fbxsdk::FbxAxisSystem::MayaYUp);
-    }
-    else
-    {
-        fbxScene->GetGlobalSettings().SetAxisSystem(fbxsdk::FbxAxisSystem::MayaZUp);
-    }
-    fbxScene->GetGlobalSettings().SetSystemUnit(fbxsdk::FbxSystemUnit(stage->worldUnits * 100.0));
-
-    auto child = fbxScene->GetRootNode()->GetChild(0);
-    auto exporter = FbxExporterCreator(manager.get(), "");
     auto fbxBlob = createOmniConverterBlob(nullptr, 0);
-    CustomFBXWriteStream writeStream(manager.get(), fbxBlob);
-    if (mExportContext->converterContext.EmbeddingTextures())
     {
-        ioSettings->SetBoolProp(EXP_FBX_EMBEDDED, true);
-    }
-    bool exportSuccess = exporter->Initialize(&writeStream, nullptr, -1, ioSettings.get());
-    if (!exportSuccess)
-    {
-        status = OmniConverterStatus::UNSUPPORTED_IMPORT_FORMAT;
-    }
-    else
-    {
-        exportSuccess = exporter->Export(fbxScene.get());
+        std::lock_guard<std::mutex> lock(gFbxManagerLock);
+        auto manager = FbxManagerCreator();
+        auto ioSettings = FbxSettingsCreator(manager.get(), IOSROOT);
+        manager->SetIOSettings(ioSettings.get());
+
+        auto fbxScene = ToFbxScene(manager.get(), stage);
+        if (!fbxScene || mExportContext->IsExited())
+        {
+            return OmniConverterStatus::CANCELLED;
+        }
+
+        FbxDocumentInfo* sceneInfo = FbxDocumentInfo::Create(manager.get(), "SceneInfo");
+        sceneInfo->mTitle = "Omniverse Converter";
+        sceneInfo->mSubject = "usd-convert-asset";
+        sceneInfo->mAuthor = "NVIDIA Omniverse";
+        sceneInfo->mRevision = "6.0";
+        sceneInfo->mKeywords = "USD to FBX, Omniverse";
+        sceneInfo->mComment = "This asset is converted from USD.";
+        fbxScene->SetSceneInfo(sceneInfo);
+        if (stage->yAxis)
+        {
+            fbxScene->GetGlobalSettings().SetAxisSystem(fbxsdk::FbxAxisSystem::MayaYUp);
+        }
+        else
+        {
+            fbxScene->GetGlobalSettings().SetAxisSystem(fbxsdk::FbxAxisSystem::MayaZUp);
+        }
+        fbxScene->GetGlobalSettings().SetSystemUnit(fbxsdk::FbxSystemUnit(stage->worldUnits * 100.0));
+
+        auto exporter = FbxExporterCreator(manager.get(), "");
+        CustomFBXWriteStream writeStream(manager.get(), fbxBlob);
+        if (mExportContext->converterContext.EmbeddingTextures())
+        {
+            ioSettings->SetBoolProp(EXP_FBX_EMBEDDED, true);
+        }
+        bool exportSuccess = exporter->Initialize(&writeStream, nullptr, -1, ioSettings.get());
+        if (!exportSuccess)
+        {
+            detailedError = "Failed to initialize the FBX exporter for " + mExportContext->converterContext.GetOutputAssetPath() + ".";
+            Log(detailedError);
+            status = OmniConverterStatus::UNSUPPORTED_EXPORT_FORMAT;
+        }
+        else
+        {
+            exportSuccess = exporter->Export(fbxScene.get());
+            if (!exportSuccess)
+            {
+                detailedError = "Failed to export asset " + mExportContext->converterContext.GetImportAssetPath() + " to FBX.";
+                Log(detailedError);
+                status = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
+            }
+        }
     }
 
-    if (!exportSuccess)
+    if (status == OmniConverterStatus::OK && !UploadContent(mExportContext->converterContext.GetOutputAssetPath(), fbxBlob.get()))
     {
-        Log("Failed to export asset " + mExportContext->converterContext.GetImportAssetPath());
-        status = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
+        detailedError = "Failed to write FBX file " + mExportContext->converterContext.GetOutputAssetPath() + ".";
+        Log(detailedError);
+        status = OmniConverterStatus::FILE_WRITE_ERROR;
     }
-    else
-    {
-        UploadContent(mExportContext->converterContext.GetOutputAssetPath(), fbxBlob.get());
-    }
-
-    fbxScene.reset();
-    exporter.reset();
-    ioSettings.reset();
-    manager.reset();
 
     return status;
 }
 
-OmniConverterStatus FbxSdkExporter::ExportTextures(const StagePtr& stage)
+OmniConverterStatus FbxSdkExporter::ExportTextures(const StagePtr& stage, std::string& detailedError)
 {
     Log("Starting to export textures...");
     static auto ClearInMemoryTexture = [](TextureImagePtr& texture)
@@ -171,7 +172,7 @@ OmniConverterStatus FbxSdkExporter::ExportTextures(const StagePtr& stage)
         }
 
         TextureImagePtr texture = stage->images[i];
-        UploadTextureIfNotEmpty(texture);
+        ENSURE_STATUS_OK(UploadTextureIfNotEmpty(texture, detailedError));
         ClearInMemoryTexture(texture);
         mExportContext->IncrementProgress();
     }
@@ -179,7 +180,7 @@ OmniConverterStatus FbxSdkExporter::ExportTextures(const StagePtr& stage)
     return OmniConverterStatus::OK;
 }
 
-OmniConverterStatus FbxSdkExporter::UploadTextureIfNotEmpty(const TextureImagePtr& texture)
+OmniConverterStatus FbxSdkExporter::UploadTextureIfNotEmpty(const TextureImagePtr& texture, std::string& detailedError)
 {
     if (!texture)
     {
@@ -190,19 +191,24 @@ OmniConverterStatus FbxSdkExporter::UploadTextureIfNotEmpty(const TextureImagePt
     {
         const std::string& filename = PathUtils::GetFileName(texture->originalPath, true);
         const std::string& targetPath = PathUtils::JoinPaths(mTexturesExportRoot, filename);
-        UploadContent(targetPath, texture->blob.get());
+        if (!UploadContent(targetPath, texture->blob.get()))
+        {
+            detailedError = "Failed to write FBX texture " + targetPath + ".";
+            Log(detailedError);
+            return OmniConverterStatus::FILE_WRITE_ERROR;
+        }
         mTextureUploadPath[texture] = targetPath;
     }
     else
     {
-        UploadFileInternal(texture->realPath, mTexturesExportRoot);
+        ENSURE_STATUS_OK(UploadFileInternal(texture->realPath, mTexturesExportRoot, detailedError));
         mTextureUploadPath[texture] = mUploadedFiles[texture->realPath];
     }
 
     return OmniConverterStatus::OK;
 }
 
-OmniConverterStatus FbxSdkExporter::UploadFileInternal(const std::string& filePath, const std::string& targetDir)
+OmniConverterStatus FbxSdkExporter::UploadFileInternal(const std::string& filePath, const std::string& targetDir, std::string& detailedError)
 {
     auto iter = mUploadedFiles.find(filePath);
     if (iter == mUploadedFiles.end())
@@ -212,9 +218,9 @@ OmniConverterStatus FbxSdkExporter::UploadFileInternal(const std::string& filePa
         mUploadedFiles[filePath] = outFilePath;
         if (!mExportContext->converterContext.CopyFile(outFilePath, filePath))
         {
-            std::string detailedError = "Failed to copy file " + filePath + " to " + outFilePath + ".";
+            detailedError = "Failed to copy file " + filePath + " to " + outFilePath + ".";
             Log(detailedError);
-            return OmniConverterStatus::CANCELLED;
+            return OmniConverterStatus::FILE_WRITE_ERROR;
         }
     }
 
@@ -254,7 +260,7 @@ fbxsdk::FbxSurfaceMaterial* FbxSdkExporter::ToFbxMaterial(const StagePtr& stage,
                                           const OmniConverterMaterialProperty& inputProperty,
                                           const std::string& fbxPropertyName,
                                           fbxsdk::FbxPropertyT<fbxsdk::FbxDouble3>& fbxProperty
-                                      )
+                                      ) -> bool
         {
             if (inputProperty.displayName == fbxPropertyName)
             {
@@ -269,9 +275,12 @@ fbxsdk::FbxSurfaceMaterial* FbxSdkExporter::ToFbxMaterial(const StagePtr& stage,
                 {
                     fbxProperty.Set(ToFbxDouble3(inputProperty));
                 }
+                return true;
             }
+            return false;
         };
 
+        bool mappedDiffuseColor = false;
         for (const auto& inputProperty : material->inputProperties)
         {
             if (inputProperty.valueType == OMNI_CONVERTER_VALUE_TYPE_UNDEFINED)
@@ -279,7 +288,7 @@ fbxsdk::FbxSurfaceMaterial* FbxSdkExporter::ToFbxMaterial(const StagePtr& stage,
                 continue;
             }
 
-            ConnectDouble3Property(fbxScene, inputProperty, fbxsdk::FbxSurfacePhong::sDiffuse, fbxMaterial->Diffuse);
+            mappedDiffuseColor |= ConnectDouble3Property(fbxScene, inputProperty, fbxsdk::FbxSurfacePhong::sDiffuse, fbxMaterial->Diffuse);
             ConnectDoubleProperty(fbxScene, inputProperty, fbxsdk::FbxSurfacePhong::sDiffuseFactor, fbxMaterial->DiffuseFactor);
             ConnectDouble3Property(fbxScene, inputProperty, fbxsdk::FbxSurfacePhong::sEmissive, fbxMaterial->Emissive);
             ConnectDoubleProperty(fbxScene, inputProperty, fbxsdk::FbxSurfacePhong::sEmissiveFactor, fbxMaterial->EmissiveFactor);
@@ -291,6 +300,10 @@ fbxsdk::FbxSurfaceMaterial* FbxSdkExporter::ToFbxMaterial(const StagePtr& stage,
             ConnectDoubleProperty(fbxScene, inputProperty, fbxsdk::FbxSurfacePhong::sAmbientFactor, fbxMaterial->AmbientFactor);
             ConnectDouble3Property(fbxScene, inputProperty, fbxsdk::FbxSurfacePhong::sDisplacementColor, fbxMaterial->DisplacementColor);
             ConnectDoubleProperty(fbxScene, inputProperty, fbxsdk::FbxSurfacePhong::sDisplacementFactor, fbxMaterial->DisplacementFactor);
+        }
+        if (!mappedDiffuseColor && material->hasDiffuseColor)
+        {
+            fbxMaterial->Diffuse.Set(GfVec3fToFbxDouble3(material->diffuseColor));
         }
     }
     else
@@ -390,11 +403,21 @@ fbxsdk::FbxMesh* FbxSdkExporter::ToFbxMesh(fbxsdk::FbxScene* fbxScene, const Mes
     materialElement->SetReferenceMode(FbxGeometryElement::eIndexToDirect);
 
     fbxsdk::FbxGeometryElementNormal* normalElement = nullptr;
+    const bool hasFaceVaryingNormals = mesh->hasFaceVaryingNormals || (!mesh->normals.empty() && mesh->normals.size() != mesh->points.size());
     if (!mesh->normals.empty())
     {
         normalElement = fbxMesh->CreateElementNormal();
-        normalElement->SetMappingMode(fbxsdk::FbxGeometryElement::eByPolygonVertex);
+        normalElement->SetMappingMode(
+            hasFaceVaryingNormals ? fbxsdk::FbxGeometryElement::eByPolygonVertex : fbxsdk::FbxGeometryElement::eByControlPoint
+        );
         normalElement->SetReferenceMode(fbxsdk::FbxGeometryElement::eDirect);
+        if (!hasFaceVaryingNormals)
+        {
+            for (const auto& normal : mesh->normals)
+            {
+                normalElement->GetDirectArray().Add(GfVec3fToFbxVector4(normal));
+            }
+        }
     }
 
     fbxsdk::FbxGeometryElementVertexColor* colorElement = nullptr;
@@ -430,7 +453,7 @@ fbxsdk::FbxMesh* FbxSdkExporter::ToFbxMesh(fbxsdk::FbxScene* fbxScene, const Mes
             }
             fbxMesh->EndPolygon();
 
-            if (!mesh->normals.empty())
+            if (hasFaceVaryingNormals)
             {
                 for (size_t j = 0; j < faceVerticesCount; j++)
                 {
@@ -794,7 +817,7 @@ void FbxSdkExporter::PopulateStageNodeTree(
         if (i < currentNode->transformAnimationTracks.size())
         {
             auto animLayer = mAllAnimLayers[i];
-            SetNodeTRSSamples(stage, node, mAllAnimLayers[i], currentNode->transformAnimationTracks[i]);
+            SetNodeTRSSamples(stage->animationTracks[i].fps, node, animLayer, currentNode->transformAnimationTracks[i]);
         }
     }
     parentFbxNode->AddChild(node);
@@ -850,74 +873,29 @@ void FbxSdkExporter::SetDefaultMatrix(fbxsdk::FbxNode* node, const PXR_NS::GfMat
     node->LclRotation.Set(GfVec3dToFbxDouble3(trs.r));
 }
 
-void FbxSdkExporter::SetTimeSampledTranslation(
-    fbxsdk::FbxNode* node,
-    fbxsdk::FbxAnimLayer* animLayer,
+static void SetTimeSampledVector(
+    fbxsdk::FbxPropertyT<fbxsdk::FbxDouble3>& property,
+    fbxsdk::FbxAnimLayer* layer,
     fbxsdk::FbxTime time,
-    const PXR_NS::GfVec3d& sample
+    const PXR_NS::GfVec3d& sample,
+    bool interpolate
 )
 {
-    auto animTranslationXCurve = node->LclTranslation.GetCurve(animLayer, FBXSDK_CURVENODE_COMPONENT_X, true);
-    auto animTranslationYCurve = node->LclTranslation.GetCurve(animLayer, FBXSDK_CURVENODE_COMPONENT_Y, true);
-    auto animTranslationZCurve = node->LclTranslation.GetCurve(animLayer, FBXSDK_CURVENODE_COMPONENT_Z, true);
-
-    fbxsdk::FbxAnimCurve* translationCurves[3] = { animTranslationXCurve, animTranslationYCurve, animTranslationZCurve };
-    for (size_t i = 0; i < 3; i++)
+    const char* components[] = { FBXSDK_CURVENODE_COMPONENT_X, FBXSDK_CURVENODE_COMPONENT_Y, FBXSDK_CURVENODE_COMPONENT_Z };
+    for (size_t i = 0; i < 3; ++i)
     {
-        translationCurves[i]->KeyModifyBegin();
-        auto keyIndex = translationCurves[i]->KeyAdd(time);
-        translationCurves[i]->KeySetTime(keyIndex, time);
-        translationCurves[i]->KeySetValue(keyIndex, sample[i]);
-        translationCurves[i]->KeySetInterpolation(keyIndex, fbxsdk::FbxAnimCurveDef::eInterpolationConstant);
-        translationCurves[i]->KeyModifyEnd();
-    }
-}
-
-void FbxSdkExporter::SetTimeSampledScale(fbxsdk::FbxNode* node, fbxsdk::FbxAnimLayer* animLayer, fbxsdk::FbxTime time, const PXR_NS::GfVec3d& sample)
-{
-    auto animScaleXCurve = node->LclScaling.GetCurve(animLayer, FBXSDK_CURVENODE_COMPONENT_X, true);
-    auto animScaleYCurve = node->LclScaling.GetCurve(animLayer, FBXSDK_CURVENODE_COMPONENT_Y, true);
-    auto animScaleZCurve = node->LclScaling.GetCurve(animLayer, FBXSDK_CURVENODE_COMPONENT_Z, true);
-
-    fbxsdk::FbxAnimCurve* scaleCurves[3] = { animScaleXCurve, animScaleYCurve, animScaleZCurve };
-
-    for (size_t i = 0; i < 3; i++)
-    {
-        scaleCurves[i]->KeyModifyBegin();
-        auto keyIndex = scaleCurves[i]->KeyAdd(time);
-        scaleCurves[i]->KeySetTime(keyIndex, time);
-        scaleCurves[i]->KeySetValue(keyIndex, sample[i]);
-        scaleCurves[i]->KeySetInterpolation(keyIndex, fbxsdk::FbxAnimCurveDef::eInterpolationConstant);
-        scaleCurves[i]->KeyModifyEnd();
-    }
-}
-
-void FbxSdkExporter::SetTimeSampledRotationXYZ(
-    fbxsdk::FbxNode* node,
-    fbxsdk::FbxAnimLayer* animLayer,
-    fbxsdk::FbxTime time,
-    const PXR_NS::GfVec3d& sample
-)
-{
-    auto animRotationXCurve = node->LclRotation.GetCurve(animLayer, FBXSDK_CURVENODE_COMPONENT_X, true);
-    auto animRotationYCurve = node->LclRotation.GetCurve(animLayer, FBXSDK_CURVENODE_COMPONENT_Y, true);
-    auto animRotationZCurve = node->LclRotation.GetCurve(animLayer, FBXSDK_CURVENODE_COMPONENT_Z, true);
-
-    fbxsdk::FbxAnimCurve* rotationCurves[3] = { animRotationXCurve, animRotationYCurve, animRotationZCurve };
-
-    for (size_t i = 0; i < 3; i++)
-    {
-        rotationCurves[i]->KeyModifyBegin();
-        auto keyIndex = rotationCurves[i]->KeyAdd(time);
-        rotationCurves[i]->KeySetTime(keyIndex, time);
-        rotationCurves[i]->KeySetValue(keyIndex, sample[i]);
-        rotationCurves[i]->KeySetInterpolation(keyIndex, fbxsdk::FbxAnimCurveDef::eInterpolationConstant);
-        rotationCurves[i]->KeyModifyEnd();
+        auto* curve = property.GetCurve(layer, components[i], true);
+        curve->KeyModifyBegin();
+        const auto key = curve->KeyAdd(time);
+        curve->KeySetTime(key, time);
+        curve->KeySetValue(key, sample[i]);
+        curve->KeySetInterpolation(key, interpolate ? fbxsdk::FbxAnimCurveDef::eInterpolationLinear : fbxsdk::FbxAnimCurveDef::eInterpolationConstant);
+        curve->KeyModifyEnd();
     }
 }
 
 void FbxSdkExporter::SetNodeTRSSamples(
-    const StagePtr& stage,
+    double samplesPerSecond,
     fbxsdk::FbxNode* node,
     fbxsdk::FbxAnimLayer* animLayer,
     const TransformTimesamples& transformTimesamples
@@ -925,26 +903,86 @@ void FbxSdkExporter::SetNodeTRSSamples(
 {
     const auto& translations = transformTimesamples.GetTranslationSamples();
     const auto& scalings = transformTimesamples.GetScaleSamples();
-    const auto& rotationXYZs = transformTimesamples.GetRotationXYZSamples();
     for (size_t j = 0; j < translations.size(); j++)
     {
         fbxsdk::FbxTime time;
-        time.SetFrame(j); // FIXME: Currently, it assumes 24 frames/s.
-        SetTimeSampledTranslation(node, animLayer, time, translations[j]);
+        time.SetSecondDouble(transformTimesamples.GetSampleTime(j, TransformChannel::Translation) / samplesPerSecond);
+        SetTimeSampledVector(
+            node->LclTranslation,
+            animLayer,
+            time,
+            translations[j],
+            transformTimesamples.InterpolatesSamples(TransformChannel::Translation)
+        );
     }
 
     for (size_t j = 0; j < scalings.size(); j++)
     {
         fbxsdk::FbxTime time;
-        time.SetFrame(j); // FIXME: Currently, it assumes 24 frames/s.
-        SetTimeSampledScale(node, animLayer, time, scalings[j]);
+        time.SetSecondDouble(transformTimesamples.GetSampleTime(j, TransformChannel::Scale) / samplesPerSecond);
+        SetTimeSampledVector(node->LclScaling, animLayer, time, scalings[j], transformTimesamples.InterpolatesSamples(TransformChannel::Scale));
     }
 
-    for (size_t j = 0; j < rotationXYZs.size(); j++)
+    if (transformTimesamples.InterpolatesSamples(TransformChannel::Rotation))
     {
-        fbxsdk::FbxTime time;
-        time.SetFrame(j); // FIXME: Currently, it assumes 24 frames/s.
-        SetTimeSampledRotationXYZ(node, animLayer, time, rotationXYZs[j]);
+        // FBX stores Euler curves. Sample the quaternion path at at most 1/24-second
+        // intervals, refining where Euler interpolation differs from the quaternion path.
+        const auto& orients = transformTimesamples.GetOrientSamples();
+        fbxsdk::FbxVector4 previousEuler;
+        for (size_t j = 0; j < orients.size(); ++j)
+        {
+            const size_t previous = j == 0 ? 0 : j - 1;
+            const double start = transformTimesamples.GetSampleTime(previous, TransformChannel::Rotation);
+            const double end = transformTimesamples.GetSampleTime(j, TransformChannel::Rotation);
+            const size_t steps = std::max<size_t>(1, static_cast<size_t>(std::ceil((end - start) * 24.0 / samplesPerSecond)));
+            const auto writeRotation = [&](auto&& self, double from, double to, unsigned depth) -> void
+            {
+                const auto orient = PXR_NS::GfSlerp(to, orients[previous], orients[j]);
+                const auto angles = MathUtils::QuatenionToEulerAngles(orient);
+                fbxsdk::FbxVector4 euler(angles[0], angles[1], angles[2]);
+                if (j != 0)
+                {
+                    fbxsdk::FbxGetContinuousRotation(euler, euler, previousEuler);
+                    // Check inside the interval, not just at its authored endpoints.
+                    // Bound refinement depth to cap work near Euler singularities.
+                    for (double fraction : { 0.25, 0.5, 0.75 })
+                    {
+                        fbxsdk::FbxAMatrix interpolated;
+                        interpolated.SetR(previousEuler + (euler - previousEuler) * fraction);
+                        const auto actual = interpolated.GetQ();
+                        const auto expected = PXR_NS::GfSlerp(from + fraction * (to - from), orients[previous], orients[j]);
+                        const auto im = expected.GetImaginary();
+                        const double dot = actual[3] * expected.GetReal() + actual[0] * im[0] + actual[1] * im[1] + actual[2] * im[2];
+                        // cos(0.1 degrees / 2): quaternion dot measures half the angle.
+                        if (std::abs(dot) < 0.9999996192282494 && depth < 10)
+                        {
+                            const double middle = (from + to) * 0.5;
+                            self(self, from, middle, depth + 1);
+                            self(self, middle, to, depth + 1);
+                            return;
+                        }
+                    }
+                }
+                previousEuler = euler;
+                fbxsdk::FbxTime time;
+                time.SetSecondDouble((start + to * (end - start)) / samplesPerSecond);
+                SetTimeSampledVector(node->LclRotation, animLayer, time, PXR_NS::GfVec3d(euler[0], euler[1], euler[2]), true);
+            };
+            for (size_t step = 1; step <= steps; ++step)
+            {
+                writeRotation(writeRotation, static_cast<double>(step - 1) / steps, static_cast<double>(step) / steps, 0);
+            }
+        }
+    }
+    else
+    {
+        const auto& rotationXYZs = transformTimesamples.GetRotationXYZSamples();
+        for (size_t j = 0; j < rotationXYZs.size(); j++)
+        {
+            fbxsdk::FbxTime time;
+            time.SetSecondDouble(transformTimesamples.GetSampleTime(j, TransformChannel::Rotation) / samplesPerSecond);
+            SetTimeSampledVector(node->LclRotation, animLayer, time, rotationXYZs[j], false);
+        }
     }
 }
 

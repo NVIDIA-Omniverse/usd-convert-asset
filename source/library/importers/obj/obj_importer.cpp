@@ -19,8 +19,16 @@ namespace
 // "nan" / "inf" fail parse and silently fall back to 0.0, so a post-LoadObj
 // isfinite() check never sees them. Scan raw vertex-attribute lines with
 // strtod(), which does recognize non-finite literals.
-bool ObjDataHasNonFiniteVertexAttributes(std::string_view objData)
+struct ObjNonFiniteAttributes
 {
+    std::vector<bool> vertices;
+    std::vector<bool> normals;
+    std::vector<bool> texcoords;
+};
+
+ObjNonFiniteAttributes FindObjNonFiniteAttributes(std::string_view objData)
+{
+    ObjNonFiniteAttributes result;
     auto isSpace = [](char c)
     {
         return c == ' ' || c == '\t';
@@ -75,6 +83,7 @@ bool ObjDataHasNonFiniteVertexAttributes(std::string_view objData)
         // Copy the remainder so strtod can see a NUL-terminated buffer.
         const std::string values(line.substr(keywordEnd));
         const char* token = values.c_str();
+        bool nonFinite = false;
         while (*token != '\0')
         {
             while (isSpace(*token))
@@ -101,13 +110,15 @@ bool ObjDataHasNonFiniteVertexAttributes(std::string_view objData)
 
             if (errno == ERANGE || !std::isfinite(value))
             {
-                return true;
+                nonFinite = true;
             }
             token = parseEnd;
         }
+        auto& flags = keywordEnd == cursor + 1 ? result.vertices : (line[cursor + 1] == 'n' ? result.normals : result.texcoords);
+        flags.push_back(nonFinite);
     }
 
-    return false;
+    return result;
 }
 } // namespace
 
@@ -243,13 +254,20 @@ StagePtr ObjImporter::ImportStage(const OmniFutureThreadContextPtr& context, Omn
     }
 
     std::string objData((const char*)objBlob->buffer, objBlob->size);
-    if (ObjDataHasNonFiniteVertexAttributes(objData))
+    const auto nonFiniteAttributes = FindObjNonFiniteAttributes(objData);
+    const auto anyFlagged = [](const std::vector<bool>& flags)
     {
-        detailedError = "Asset " + importAssetPath + " contains non-finite vertex attribute values.";
-        Log(detailedError);
-        status = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
-        return nullptr;
-    }
+        return std::any_of(
+            flags.begin(),
+            flags.end(),
+            [](bool value)
+            {
+                return value;
+            }
+        );
+    };
+    bool detectedNonFiniteAttributes = anyFlagged(nonFiniteAttributes.vertices) || anyFlagged(nonFiniteAttributes.normals) ||
+                                       anyFlagged(nonFiniteAttributes.texcoords);
 
     std::istringstream sourceStream(objData);
 
@@ -291,24 +309,38 @@ StagePtr ObjImporter::ImportStage(const OmniFutureThreadContextPtr& context, Omn
         stage->yAxis = false;
     }
 
-    auto hasNonFinite = [](const std::vector<tinyobj::real_t>& values)
+    auto hasNonFinite = [](const std::vector<tinyobj::real_t>& values, size_t index, size_t width, const std::vector<bool>& rawFlags)
     {
+        if (index < rawFlags.size() && rawFlags[index])
+        {
+            return true;
+        }
+        const size_t offset = index * width;
+        if (offset + width > values.size())
+        {
+            return false;
+        }
         return std::any_of(
-            values.begin(),
-            values.end(),
+            values.begin() + offset,
+            values.begin() + offset + width,
             [](tinyobj::real_t value)
             {
                 return !std::isfinite(value);
             }
         );
     };
-    if (hasNonFinite(attributes.vertices) || hasNonFinite(attributes.normals) || hasNonFinite(attributes.texcoords) ||
-        hasNonFinite(attributes.colors))
+    // A finite double can overflow tinyobj's float storage. Detect parsed values
+    // too, including records that no face references.
+    for (const auto* values : { &attributes.vertices, &attributes.normals, &attributes.texcoords, &attributes.colors })
     {
-        detailedError = "Asset " + importAssetPath + " contains non-finite vertex attribute values.";
-        Log(detailedError);
-        status = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
-        return nullptr;
+        detectedNonFiniteAttributes = detectedNonFiniteAttributes || std::any_of(
+                                                                         values->begin(),
+                                                                         values->end(),
+                                                                         [](tinyobj::real_t value)
+                                                                         {
+                                                                             return !std::isfinite(value);
+                                                                         }
+                                                                     );
     }
 
     size_t numPoints = attributes.vertices.size() / 3;
@@ -434,6 +466,7 @@ StagePtr ObjImporter::ImportStage(const OmniFutureThreadContextPtr& context, Omn
             // Skipping the whole face (rather than an individual corner) keeps faceVertexCounts,
             // normals, uvs, and colors consistent for the mesh.
             bool faceValid = true;
+            bool faceNonFinite = false;
             for (size_t v = 0; v < fv; v++)
             {
                 const tinyobj::index_t& idx = shape.mesh.indices[indexOffset + v];
@@ -452,6 +485,21 @@ StagePtr ObjImporter::ImportStage(const OmniFutureThreadContextPtr& context, Omn
                     faceValid = false;
                     break;
                 }
+                if (hasNonFinite(attributes.vertices, size_t(idx.vertex_index), 3, nonFiniteAttributes.vertices) ||
+                    hasNonFinite(attributes.colors, size_t(idx.vertex_index), 3, nonFiniteAttributes.vertices) ||
+                    (idx.normal_index >= 0 && hasNonFinite(attributes.normals, size_t(idx.normal_index), 3, nonFiniteAttributes.normals)) ||
+                    (idx.texcoord_index >= 0 && hasNonFinite(attributes.texcoords, size_t(idx.texcoord_index), 2, nonFiniteAttributes.texcoords)))
+                {
+                    faceNonFinite = true;
+                    break;
+                }
+            }
+            if (faceNonFinite)
+            {
+                Log("WARNING: OBJ shape '" + shapeName + "' face " + std::to_string(f) +
+                    " contains non-finite vertex attribute values. Skipping this face.");
+                indexOffset += fv;
+                continue;
             }
             if (!faceValid)
             {
@@ -565,6 +613,12 @@ StagePtr ObjImporter::ImportStage(const OmniFutureThreadContextPtr& context, Omn
                 meshInfo.mesh->colors.clear();
             }
 
+            // These arrays were appended in face-corner order, independently of point order.
+            // Equal point and corner counts do not make them per-point attributes.
+            meshInfo.mesh->hasFaceVaryingNormals = meshInfo.hasNormals;
+            meshInfo.mesh->hasFaceVaryingUVs = meshInfo.hasUVs;
+            meshInfo.mesh->hasFaceVaryingColors = meshInfo.hasColors;
+
             MeshGeomSubset subset;
             subset.materialIndex = subsetMesh.first;
             subset.name = meshInfo.mesh->name;
@@ -573,6 +627,15 @@ StagePtr ObjImporter::ImportStage(const OmniFutureThreadContextPtr& context, Omn
             meshInfo.mesh->meshSubsets.push_back(subset);
             stage->meshes.push_back(meshInfo.mesh);
         }
+    }
+
+    stage->hasSkippedCorruptGeometry = detectedNonFiniteAttributes;
+    if (detectedNonFiniteAttributes && stage->meshes.empty())
+    {
+        detailedError = "Asset " + importAssetPath + " contains non-finite vertex attribute values; no valid mesh geometry remains.";
+        Log(detailedError);
+        status = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
+        return nullptr;
     }
 
     auto groupNode = std::make_shared<StageNode>(mThreadContext->converterContext.GetImportAssetFileName());

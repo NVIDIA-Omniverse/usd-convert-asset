@@ -15,12 +15,41 @@ using namespace omni::assetconverter::importer::gltf;
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include <stdexcept>
 
 #define DEFAULT_FPS 24.0f
 
 static bool InRange(size_t value, size_t low, size_t high)
 {
     return (value >= low && value < high);
+}
+
+static bool IsFinite(const PXR_NS::GfVec2f& value)
+{
+    return std::isfinite(value[0]) && std::isfinite(value[1]);
+}
+
+static bool IsFinite(const PXR_NS::GfVec3f& value)
+{
+    return std::isfinite(value[0]) && std::isfinite(value[1]) && std::isfinite(value[2]);
+}
+
+static bool IsFinite(const PXR_NS::GfVec4f& value)
+{
+    return std::isfinite(value[0]) && std::isfinite(value[1]) && std::isfinite(value[2]) && std::isfinite(value[3]);
+}
+
+template <typename ValueType>
+static bool HasNonFiniteValues(const PXR_NS::VtArray<ValueType>& values, const PXR_NS::VtIntArray& indices)
+{
+    return std::any_of(
+        indices.begin(),
+        indices.end(),
+        [&values](int index)
+        {
+            return index >= 0 && static_cast<size_t>(index) < values.size() && !IsFinite(values[index]);
+        }
+    );
 }
 
 static size_t GetGltfComponentSize(int componentType)
@@ -68,6 +97,23 @@ static size_t GetGltfTypeComponentCount(int type)
 
 static bool ValidateGltfAccessorExtents(const tinygltf::Model& model, std::string& error)
 {
+    for (size_t meshIndex = 0; meshIndex < model.meshes.size(); ++meshIndex)
+    {
+        const auto& mesh = model.meshes[meshIndex];
+        for (size_t primitiveIndex = 0; primitiveIndex < mesh.primitives.size(); ++primitiveIndex)
+        {
+            for (const auto& attribute : mesh.primitives[primitiveIndex].attributes)
+            {
+                if (attribute.second < 0 || attribute.second >= static_cast<int>(model.accessors.size()))
+                {
+                    error = "glTF mesh " + std::to_string(meshIndex) + " primitive " + std::to_string(primitiveIndex) + " attribute '" +
+                            attribute.first + "' references an invalid accessor.";
+                    return false;
+                }
+            }
+        }
+    }
+
     for (size_t accessorIndex = 0; accessorIndex < model.accessors.size(); ++accessorIndex)
     {
         const auto& accessor = model.accessors[accessorIndex];
@@ -586,6 +632,10 @@ static ValueType GetIntepolatedValue(
 template <typename ValueType, typename Traits = TinygltfTypeTraits<ValueType>>
 static PXR_NS::VtArray<ValueType> PopulateNumberBufferData(const tinygltf::Model& model, int bufferIndex, bool cubicSpline = false, double scale = 1.0f)
 {
+    if (bufferIndex < 0 || bufferIndex >= static_cast<int>(model.accessors.size()))
+    {
+        return {};
+    }
     const auto attribAccessor = model.accessors[bufferIndex];
 
     // Check if bufferView is valid (can be -1 for Draco compressed meshes)
@@ -628,7 +678,7 @@ static PXR_NS::VtArray<ValueType> PopulateNumberBufferData(const tinygltf::Model
         // Algorithm is referred from Assimp to handle cubiespline interpolation.
         size_t ii = cubicSpline && adapter.elemCount > 1 ? 1 : 0;
         size_t step = cubicSpline && adapter.elemCount > 1 ? 3 : 1;
-        for (size_t i = 0; i < adapter.elemCount; i++)
+        for (; ii < adapter.elemCount;)
         {
             attributeValues.push_back(ValueType(adapter[ii] * scale));
             ii += step;
@@ -639,7 +689,7 @@ static PXR_NS::VtArray<ValueType> PopulateNumberBufferData(const tinygltf::Model
         ArrayAdapter<DoubleType> adapter(dataPtr, count, byte_stride);
         size_t ii = cubicSpline && adapter.elemCount > 1 ? 1 : 0;
         size_t step = cubicSpline && adapter.elemCount > 1 ? 3 : 1;
-        for (size_t i = 0; i < adapter.elemCount; i++)
+        for (; ii < adapter.elemCount;)
         {
             attributeValues.push_back(ValueType(adapter[ii] * scale));
             ii += step;
@@ -647,6 +697,12 @@ static PXR_NS::VtArray<ValueType> PopulateNumberBufferData(const tinygltf::Model
     }
 
     return attributeValues;
+}
+
+template <typename ValueType>
+static bool HasNonFiniteAccessorValues(const tinygltf::Model& model, int accessorIndex, const PXR_NS::VtIntArray& indices)
+{
+    return HasNonFiniteValues(PopulateNumberBufferData<ValueType>(model, accessorIndex), indices);
 }
 
 static Transform GetNodeLocalTransform(const tinygltf::Model& model, int nodeIndex, double scale = 1.0)
@@ -837,9 +893,9 @@ PXR_NS::VtArray<ValueType> PopulateTimesamplesFromAnimationSampler(
     PXR_NS::VtArray<double> keyframeTimes = PopulateNumberBufferData<double>(model, sampler.input);
     PXR_NS::VtArray<DoubleType> keyframeValues = PopulateNumberBufferData<DoubleType>(model, sampler.output, sampler.interpolation == "CUBICSPLINE");
 
-    if (keyframeTimes.size() == 0)
+    if (keyframeTimes.empty() || keyframeValues.size() != keyframeTimes.size())
     {
-        return {};
+        throw std::runtime_error("glTF animation sampler has unsupported or mismatched keyframe data; use FLOAT animation output accessors.");
     }
 
     PXR_NS::VtArray<ValueType> timesamples;
@@ -1106,6 +1162,7 @@ std::string GltfImporter::ComputeHash(const OmniFutureThreadContextPtr& context)
 }
 
 StagePtr GltfImporter::ImportStage(const OmniFutureThreadContextPtr& context, OmniConverterStatus& status, std::string& detailedError)
+try
 {
     if (!mModelLoaded)
     {
@@ -1142,7 +1199,12 @@ StagePtr GltfImporter::ImportStage(const OmniFutureThreadContextPtr& context, Om
         PopulateStageAnimationInfomation(stage, mGltfModel, scale);
         PopulateAllSkeletonRoots(stage, mGltfModel, scale);
         PopulateAllMaterials(stage, mGltfModel);
-        PopulateAllMeshes(stage, mGltfModel, scale);
+        if (!PopulateAllMeshes(stage, mGltfModel, scale, detailedError))
+        {
+            status = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
+            Log(detailedError);
+            return nullptr;
+        }
         PopulateAllCameras(stage, mGltfModel, scale);
         PopulateAllLights(stage, mGltfModel, scale);
         PopulateSceneGraph(stage, mGltfModel, scale);
@@ -1153,13 +1215,23 @@ StagePtr GltfImporter::ImportStage(const OmniFutureThreadContextPtr& context, Om
     return stage;
 }
 
+catch (const std::runtime_error& error)
+{
+    detailedError = error.what();
+    status = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
+    return nullptr;
+}
+
 void GltfImporter::Log(const std::string& message)
 {
     mThreadContext->converterContext.Log(message.c_str());
 }
 
-void GltfImporter::PopulateAllMeshes(StagePtr& stage, tinygltf::Model& model, double scale)
+bool GltfImporter::PopulateAllMeshes(StagePtr& stage, tinygltf::Model& model, double scale, std::string& detailedError)
 {
+    bool skippedNonFinitePrimitive = false;
+    bool hasValidGeometry = false;
+
     for (size_t i = 0; i < model.meshes.size(); i++)
     {
         const auto& mesh = model.meshes[i];
@@ -1254,9 +1326,13 @@ void GltfImporter::PopulateAllMeshes(StagePtr& stage, tinygltf::Model& model, do
                 );
                 continue;
             }
-            std::copy(points.begin(), points.end(), std::back_inserter<decltype(stageMesh->points)>(stageMesh->points));
-
             auto faceVertexIndices = PopulateFaceVertexIndices(model, primitive);
+            if (faceVertexIndices.empty() && points.size() < 3)
+            {
+                // Validate tiny implicit primitives without underflowing strip/fan generation.
+                faceVertexIndices.resize(points.size());
+                std::iota(faceVertexIndices.begin(), faceVertexIndices.end(), 0);
+            }
             if (faceVertexIndices.empty())
             {
                 // Generates faces according to face mode.
@@ -1315,15 +1391,83 @@ void GltfImporter::PopulateAllMeshes(StagePtr& stage, tinygltf::Model& model, do
                 }
             }
 
+            // Validate before appending anything: skipping a primitive must not leave
+            // points, topology, subsets, primvars, or skin influences behind.
+            std::string nonFiniteAttribute;
+            if (HasNonFiniteValues(points, faceVertexIndices))
+            {
+                nonFiniteAttribute = "POSITION";
+            }
+            for (const auto& attribute : primitive.attributes)
+            {
+                if (!nonFiniteAttribute.empty())
+                {
+                    break;
+                }
+                bool hasNonFiniteValues = false;
+                if (attribute.first == "NORMAL")
+                {
+                    hasNonFiniteValues = HasNonFiniteAccessorValues<PXR_NS::GfVec3f>(model, attribute.second, faceVertexIndices);
+                }
+                else if (attribute.first.rfind("COLOR_", 0) == 0)
+                {
+                    const auto& accessor = model.accessors[attribute.second];
+                    hasNonFiniteValues = (accessor.type == TINYGLTF_TYPE_VEC3 &&
+                                          HasNonFiniteAccessorValues<PXR_NS::GfVec3f>(model, attribute.second, faceVertexIndices)) ||
+                                         (accessor.type == TINYGLTF_TYPE_VEC4 &&
+                                          HasNonFiniteAccessorValues<PXR_NS::GfVec4f>(model, attribute.second, faceVertexIndices));
+                }
+                else if (attribute.first.rfind("TEXCOORD_", 0) == 0)
+                {
+                    hasNonFiniteValues = HasNonFiniteAccessorValues<PXR_NS::GfVec2f>(model, attribute.second, faceVertexIndices);
+                }
+                else if (attribute.first == "WEIGHTS_0")
+                {
+                    hasNonFiniteValues = HasNonFiniteAccessorValues<PXR_NS::GfVec4f>(model, attribute.second, faceVertexIndices);
+                }
+                if (hasNonFiniteValues)
+                {
+                    nonFiniteAttribute = attribute.first;
+                }
+            }
+            if (!nonFiniteAttribute.empty())
+            {
+                skippedNonFinitePrimitive = true;
+                stage->hasSkippedCorruptGeometry = true;
+                Log("WARNING: Mesh '" + stageMesh->name + "' (index=" + std::to_string(i) + ") primitive " + std::to_string(j) + " attribute '" +
+                    nonFiniteAttribute + "' contains non-finite vertex attribute values. Skipping this primitive.");
+                continue;
+            }
+            // Keep source indices for face-varying attributes. Emit only referenced points,
+            // remapping topology and skin influences together so unused NaN/Inf never escapes.
+            std::vector<int> pointRemap(points.size(), -1);
+            std::vector<size_t> keptPointIndices;
+            PXR_NS::VtIntArray remappedIndices(faceVertexIndices.size(), -1);
+            for (size_t corner = 0; corner < faceVertexIndices.size(); ++corner)
+            {
+                const int index = faceVertexIndices[corner];
+                if (index < 0 || static_cast<size_t>(index) >= points.size())
+                {
+                    continue; // Cleanup removes invalid topology, retaining the -1 sentinel.
+                }
+                if (pointRemap[index] < 0)
+                {
+                    pointRemap[index] = static_cast<int>(keptPointIndices.size());
+                    keptPointIndices.push_back(index);
+                    stageMesh->points.push_back(points[index]);
+                }
+                remappedIndices[corner] = pointRemap[index];
+            }
+
             size_t numExistingIndices = stageMesh->faceVertexIndices.size();
             // Fill face vertex indices
             std::transform(
-                faceVertexIndices.begin(),
-                faceVertexIndices.end(),
+                remappedIndices.begin(),
+                remappedIndices.end(),
                 std::back_inserter<decltype(stageMesh->faceVertexIndices)>(stageMesh->faceVertexIndices),
                 [numExistingPoints](int index)
                 {
-                    return numExistingPoints + index;
+                    return index < 0 ? -1 : static_cast<int>(numExistingPoints) + index;
                 }
             );
 
@@ -1362,7 +1506,6 @@ void GltfImporter::PopulateAllMeshes(StagePtr& stage, tinygltf::Model& model, do
                 }
 
                 const auto attribAccessor = model.accessors[iter->second];
-
                 // Check if bufferView is valid (can be -1 for Draco compressed meshes)
                 if (attribAccessor.bufferView < 0 || attribAccessor.bufferView >= static_cast<int>(model.bufferViews.size()))
                 {
@@ -1408,7 +1551,8 @@ void GltfImporter::PopulateAllMeshes(StagePtr& stage, tinygltf::Model& model, do
             // Fill uvs
             for (size_t uvIndex = 0; uvIndex < numUVSet; uvIndex++)
             {
-                auto uvs = PopulateNumberAttribute<PXR_NS::GfVec2f>(model, primitive, "TEXCOORD_" + std::to_string(uvIndex), faceVertexIndices);
+                const std::string attributeName = "TEXCOORD_" + std::to_string(uvIndex);
+                auto uvs = PopulateNumberAttribute<PXR_NS::GfVec2f>(model, primitive, attributeName, faceVertexIndices);
                 // Invert y direction to use lower-left as origin.
                 std::transform(
                     uvs.begin(),
@@ -1434,7 +1578,7 @@ void GltfImporter::PopulateAllMeshes(StagePtr& stage, tinygltf::Model& model, do
                 {
                     filled = true;
                     hasValidData = true;
-                    for (size_t jointIndex = 0; jointIndex < joints.size(); jointIndex++)
+                    for (size_t jointIndex : keptPointIndices)
                     {
                         const auto& jointInfluence = joints[jointIndex];
                         const auto& jointWeight = jointWeights[jointIndex];
@@ -1457,7 +1601,7 @@ void GltfImporter::PopulateAllMeshes(StagePtr& stage, tinygltf::Model& model, do
             // to keep the same size as the mesh vertices.
             if (!filled)
             {
-                for (size_t pointIndex = 0; pointIndex < points.size(); pointIndex++)
+                for (size_t pointIndex = 0; pointIndex < keptPointIndices.size(); pointIndex++)
                 {
                     meshVertexInfluences.jointInfluences.push_back(0);
                     meshVertexInfluences.jointInfluences.push_back(0);
@@ -1478,8 +1622,18 @@ void GltfImporter::PopulateAllMeshes(StagePtr& stage, tinygltf::Model& model, do
         }
 
         stageMesh->faceVertexCounts = PXR_NS::VtIntArray(stageMesh->faceVertexIndices.size() / 3, 3);
+        hasValidGeometry = hasValidGeometry || !stageMesh->faceVertexCounts.empty();
+        // Preserve glTF mesh indices, including slots whose primitives were all skipped.
         stage->meshes.push_back(stageMesh);
     }
+
+    if (skippedNonFinitePrimitive && !hasValidGeometry)
+    {
+        detailedError = "Asset " + mThreadContext->converterContext.GetImportAssetPath() +
+                        " contains non-finite vertex attribute values; no valid mesh geometry remains after skipping corrupt primitives.";
+        return false;
+    }
+    return true;
 }
 
 void GltfImporter::PopulateAllMaterials(StagePtr& stage, tinygltf::Model& model)
@@ -1646,13 +1800,20 @@ void GltfImporter::PopulateAllMaterials(StagePtr& stage, tinygltf::Model& model)
         }
 
         material->emissiveColor = PXR_NS::GfVec3f(gltfMaterial.emissiveFactor[0], gltfMaterial.emissiveFactor[1], gltfMaterial.emissiveFactor[2]);
+        // glTF's zero default also multiplies an emissive texture to zero.
+        material->hasEmissiveColor = true;
         if (material->emissiveColor != PXR_NS::GfVec3f(0.0f))
         {
-            material->hasEmissiveColor = true;
             material->hasEmissiveStrength = true;
-            // When we has a Emissive Color, should give it a empirical strength value
-            // We should map strength value from gltf range(0 ~16) to Kit range(0 ~DEFAULT_EMISSIVE_INTENSITY)
-            material->emissiveStrength = DEFAULT_EMISSIVE_INTENSITY / 16;
+            material->emissiveStrength = 1.0f;
+        }
+
+        double alphaFactor = gltfMaterial.pbrMetallicRoughness.baseColorFactor[3];
+        const auto specularGlossiness = gltfMaterial.extensions.find("KHR_materials_pbrSpecularGlossiness");
+        if (specularGlossiness != gltfMaterial.extensions.end())
+        {
+            std::vector<double> diffuseFactor;
+            alphaFactor = GetArrayValues(specularGlossiness->second.Get("diffuseFactor"), diffuseFactor, 4) ? diffuseFactor[3] : 1.0;
         }
 
         material->opacityMode = FromAlphaModeString(gltfMaterial.alphaMode);
@@ -1664,13 +1825,15 @@ void GltfImporter::PopulateAllMaterials(StagePtr& stage, tinygltf::Model& model)
                 material->opacityThreshold = 0.0;
                 break;
             case GLTFOpacityMode::GLTF_MASK:
+                material->opacity = alphaFactor;
                 material->hasOpacity = true;
                 material->opacityThreshold = gltfMaterial.alphaCutoff;
                 break;
             case GLTFOpacityMode::GLTF_BLEND:
+                material->opacity = alphaFactor;
                 material->hasOpacity = true;
                 material->opacityThreshold = 0.0;
-                if (gltfMaterial.doubleSided)
+                if (gltfMaterial.doubleSided && !mThreadContext->converterContext.ExportPreviewSurface())
                 {
                     // GLTF_BLEND and double sided means glass material in gltf
                     // it map to base_alpha=1(material->opacity = 1.0) and transmissionFactor=1 in usd
@@ -1907,10 +2070,7 @@ void GltfImporter::PopulateAllMaterials(StagePtr& stage, tinygltf::Model& model)
                 if (emissiveStrengthObject.IsNumber())
                 {
                     material->hasEmissiveStrength = true;
-                    // We should map strength value from gltf range(0~16) to Kit range (0~DEFAULT_EMISSIVE_INTENSITY)
-                    // TODO: the gltf range just based on experience, no official definition found
-                    // see https://github.com/KhronosGroup/glTF-Sample-Models/tree/master/2.0/EmissiveStrengthTest
-                    material->emissiveStrength = emissiveStrengthObject.GetNumberAsDouble() / 16 * DEFAULT_EMISSIVE_INTENSITY;
+                    material->emissiveStrength = emissiveStrengthObject.GetNumberAsDouble();
                 }
             }
 
@@ -1983,12 +2143,14 @@ void GltfImporter::PopulateAllMaterials(StagePtr& stage, tinygltf::Model& model)
 
 
         auto& diffuse = material->GetTextureReference(MaterialTextureType::DIFFUSE);
-        if (diffuse.IsValid() && (texturesHasAlpha.count(diffuse.imageIndex) != 0 || HasAlphaChannel(mThreadContext, stage, diffuse.imageIndex)))
+        if (material->hasOpacity && diffuse.IsValid() &&
+            (texturesHasAlpha.count(diffuse.imageIndex) != 0 || HasAlphaChannel(mThreadContext, stage, diffuse.imageIndex)))
         {
             texturesHasAlpha.insert(diffuse.imageIndex);
             auto& opacity = material->GetTextureReference(MaterialTextureType::OPACITY);
             opacity = diffuse;
             opacity.outputMode = TextureOutputMode::ALPHA;
+            opacity.scale[3] *= material->opacity;
         }
 
         stage->materials.push_back(material);

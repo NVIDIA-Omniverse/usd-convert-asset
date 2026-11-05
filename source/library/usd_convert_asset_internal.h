@@ -88,6 +88,8 @@ struct OmniConverterAssetHandle
 
 struct OmniConverterCallbacks
 {
+    bool usesDefaultBinaryWriter = false;
+    bool usesDefaultLayerWriter = false;
     OmniConverterReader readCallback = nullptr;
     OmniConverterBinaryWriter binaryWriteCallback = nullptr;
     OmniConverterUsdWriter layerWriteCallback = nullptr;
@@ -138,6 +140,8 @@ public:
     bool WriteUsdLayer(const std::string& outputPath, const std::string& layerIdentifier) const;
     bool CopyFile(const std::string& targetPath, const std::string& sourcePath) const;
     bool MakeDirectories(const std::string& directory) const;
+    bool ValidateOutputPath(std::string& error) const;
+    bool CheckOutputReplaceable(std::string& error) const;
     OmniConverterBlobPtr ReadFile(const std::string& path) const;
     bool WriteBinary(const std::string& path, OmniConverterBlob* blob) const;
     void ReportProgress(OmniConverterFuture* future, uint32_t progress, uint32_t total) const;

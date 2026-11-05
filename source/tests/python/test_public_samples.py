@@ -64,7 +64,7 @@ class TestPublicSamples(AsyncTestCase):
                 continue
 
             # these malformed robustness fixtures cannot produce valid geometry extents
-            malformed_geometry_samples = ("AllIndicesOutOfRange", "/wrongTypes/badArray.gltf", "BoxWithInfinites")
+            malformed_geometry_samples = ("AllIndicesOutOfRange", "/wrongTypes/badArray.gltf")
             if any(sample in file_path for sample in malformed_geometry_samples):
                 validate_output = False
 
@@ -92,6 +92,10 @@ class TestPublicSamples(AsyncTestCase):
                     flush=True,
                 )
                 status = await convert(file_path, output_path, None)
+                # Non-finite attributes leave no valid geometry, so the importer rejects this fixture.
+                if "BoxWithInfinites" in file_path:
+                    self.assertEqual(status, assetconverter.OmniConverterStatus.INCOMPLETE_IMPORT_FORMAT)
+                    continue
                 self.assertEqual(status, assetconverter.OmniConverterStatus.OK)
                 print(f"Validating public assimp sample output: {format_path_for_log(output_path)}", flush=True)
                 self.assertIsValidUsd(output_path, validate_geometry=validate_output)

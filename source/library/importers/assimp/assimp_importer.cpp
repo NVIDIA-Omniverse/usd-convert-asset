@@ -7,7 +7,6 @@
 #include "assimp/cfileio.h"
 #include "assimp/cimport.h"
 #include "assimp/pbrmaterial.h"
-#include "assimp/postprocess.h"
 #include "assimp/scene.h"
 
 #include <algorithm>
@@ -159,6 +158,44 @@ bool ValidateAsciiPlyElementCounts(const char* data, size_t size, std::string& e
     }
 
     return true;
+}
+
+bool AssimpMeshVertexHasNonFiniteAttributes(const aiMesh& mesh, size_t vertexIndex, double scale)
+{
+    auto isFinite = [](const aiVector3D& value)
+    {
+        return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+    };
+    auto isFiniteColor = [](const aiColor4D& value)
+    {
+        return std::isfinite(value.r) && std::isfinite(value.g) && std::isfinite(value.b) && std::isfinite(value.a);
+    };
+
+    const aiVector3D& position = mesh.mVertices[vertexIndex];
+    const PXR_NS::GfVec3f scaledPosition(position.x * scale, position.y * scale, position.z * scale);
+    const bool scaledPositionIsFinite = std::isfinite(scaledPosition[0]) && std::isfinite(scaledPosition[1]) && std::isfinite(scaledPosition[2]);
+    if (!isFinite(position) || !scaledPositionIsFinite || (mesh.HasNormals() && !isFinite(mesh.mNormals[vertexIndex])))
+    {
+        return true;
+    }
+
+    for (unsigned int channel = 0; channel < AI_MAX_NUMBER_OF_TEXTURECOORDS; ++channel)
+    {
+        if (mesh.HasTextureCoords(channel) && !isFinite(mesh.mTextureCoords[channel][vertexIndex]))
+        {
+            return true;
+        }
+    }
+
+    for (unsigned int channel = 0; channel < AI_MAX_NUMBER_OF_COLOR_SETS; ++channel)
+    {
+        if (mesh.HasVertexColors(channel) && !isFiniteColor(mesh.mColors[channel][vertexIndex]))
+        {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 } // namespace
@@ -436,12 +473,7 @@ StagePtr AssimpImporter::ImportStage(const OmniFutureThreadContextPtr& context, 
     fileIO.OpenProc = assimpFileOpenProc;
     fileIO.CloseProc = assimpFileCloseProc;
     fileIO.UserData = (aiUserData)(&assimpFileIOContext);
-    unsigned int ppsteps = 0;
-    if (mThreadContext->converterContext.SmoothNormals())
-    {
-        ppsteps = ppsteps | aiProcess_GenSmoothNormals;
-    }
-    auto assimpScene = aiImportFileExWithProperties(importAssetPath.c_str(), ppsteps, &fileIO, props.get());
+    auto assimpScene = aiImportFileExWithProperties(importAssetPath.c_str(), 0, &fileIO, props.get());
     auto sceneRAII = std::shared_ptr<const aiScene>(assimpScene, sceneDeleter);
     props.reset();
     assimpFileIOContext.cachedBlobs.clear();
@@ -462,6 +494,18 @@ StagePtr AssimpImporter::ImportStage(const OmniFutureThreadContextPtr& context, 
     }
 
     auto stage = std::make_shared<Stage>();
+    if (!mThreadContext->converterContext.IgnoreLights() && sceneRAII->mNumLights > 0)
+    {
+        Log("WARNING: Assimp import does not preserve lights.");
+    }
+    for (unsigned int i = 0; i < sceneRAII->mNumMeshes; ++i)
+    {
+        if (sceneRAII->mMeshes[i]->mNumBones > 0)
+        {
+            Log("WARNING: Assimp import does not preserve mesh skin bindings; importing static geometry.");
+            break;
+        }
+    }
     stage->yAxis = true;
 
     // override up-axis with user-defined value
@@ -523,7 +567,12 @@ StagePtr AssimpImporter::ImportStage(const OmniFutureThreadContextPtr& context, 
     PopulateAllMaterials(assimpScene, stage);
     PopulateAllCameras(assimpScene, stage);
     ReadAnimationInformation(assimpScene, stage);
-    PopulateAllMeshes(assimpScene, stage, unitsScale);
+    if (!PopulateAllMeshes(assimpScene, stage, unitsScale, detailedError))
+    {
+        status = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
+        Log(detailedError);
+        return nullptr;
+    }
     auto rootNode = assimpScene->mRootNode;
     aiMatrix4x4 identityMatrix;
     PopulateStageTree(assimpScene, rootNode, identityMatrix, stage, nullptr, unitsScale);
@@ -938,15 +987,17 @@ void AssimpImporter::PopulateAllMaterials(const aiScene* assimpScene, const Stag
     }
 }
 
-void AssimpImporter::PopulateAllMeshes(const aiScene* assimpScene, const StagePtr& stage, double scale)
+bool AssimpImporter::PopulateAllMeshes(const aiScene* assimpScene, const StagePtr& stage, double scale, std::string& detailedError)
 {
+    mAssimpMeshIndices.assign(assimpScene->mNumMeshes, size_t(-1));
     if (assimpScene->mNumMeshes == 0)
     {
-        return;
+        return true;
     }
 
-    size_t totalMesh = 0;
-    mAssimpMeshIndices.resize(assimpScene->mNumMeshes);
+    const bool preservePartialGeometry = mThreadContext->converterContext.GetImportAssetType() == AssetType::PLY;
+    bool skippedNonFiniteGeometry = false;
+    bool hasValidGeometry = false;
     for (size_t i = 0; i < assimpScene->mNumMeshes; i++)
     {
         // Skip invalid mesh if there are no vertices
@@ -956,19 +1007,55 @@ void AssimpImporter::PopulateAllMeshes(const aiScene* assimpScene, const StagePt
         bool isInvalidMesh = !assimpMesh || assimpMesh->mNumVertices == 0;
         if (isInvalidMesh)
         {
-            std::string meshName = std::string(assimpMesh->mName.C_Str());
+            std::string meshName = assimpMesh ? std::string(assimpMesh->mName.C_Str()) : "mesh";
             meshName = meshName.length() > 0 ? meshName : "mesh";
             std::string msg = "Skipped converting " + meshName + " as it's an invalid mesh or missing vertex data";
             Log(msg);
             continue;
         }
 
-        mAssimpMeshIndices[i] = totalMesh;
-        totalMesh += 1;
-
         auto mesh = std::make_shared<Mesh>();
-        stage->meshes.push_back(mesh);
         mesh->name = assimpMesh->mName.C_Str();
+
+        std::vector<size_t> validVertices;
+        std::vector<size_t> vertexRemapping(assimpMesh->mNumVertices, size_t(-1));
+        for (size_t j = 0; j < assimpMesh->mNumVertices; ++j)
+        {
+            if (AssimpMeshVertexHasNonFiniteAttributes(*assimpMesh, j, scale))
+            {
+                if (!preservePartialGeometry)
+                {
+                    detailedError = "Asset " + mThreadContext->converterContext.GetImportAssetPath() +
+                                    " contains non-finite vertex attribute values.";
+                    return false;
+                }
+                skippedNonFiniteGeometry = true;
+                stage->hasSkippedCorruptGeometry = true;
+                Log("WARNING: PLY mesh '" + mesh->name + "' (index=" + std::to_string(i) + ") vertex " + std::to_string(j) +
+                    " contains non-finite vertex attribute values. Skipping this vertex and affected faces.");
+                continue;
+            }
+            vertexRemapping[j] = validVertices.size();
+            validVertices.push_back(j);
+        }
+
+        std::vector<bool> validFaces(assimpMesh->mNumFaces, true);
+        for (size_t j = 0; j < assimpMesh->mNumFaces; ++j)
+        {
+            const aiFace& face = assimpMesh->mFaces[j];
+            for (size_t k = 0; k < face.mNumIndices; ++k)
+            {
+                if (face.mIndices[k] >= assimpMesh->mNumVertices)
+                {
+                    detailedError = "Mesh '" + mesh->name + "' contains an out-of-range face vertex index.";
+                    return false;
+                }
+                if (vertexRemapping[face.mIndices[k]] == size_t(-1))
+                {
+                    validFaces[j] = false;
+                }
+            }
+        }
 
         if (isPointCloud)
         {
@@ -979,7 +1066,7 @@ void AssimpImporter::PopulateAllMeshes(const aiScene* assimpScene, const StagePt
             }
 
             // Populate points and normals
-            for (size_t j = 0; j < assimpMesh->mNumVertices; j++)
+            for (size_t j : validVertices)
             {
                 mesh->points.push_back(AiVector3dToGfVector3f(assimpMesh->mVertices[j]) * scale);
                 if (assimpMesh->HasNormals())
@@ -998,7 +1085,7 @@ void AssimpImporter::PopulateAllMeshes(const aiScene* assimpScene, const StagePt
                     if (assimpMesh->HasVertexColors(i))
                     {
                         mesh->colors[i].reserve(assimpMesh->mNumVertices);
-                        for (unsigned int j = 0; j < assimpMesh->mNumVertices; ++j)
+                        for (size_t j : validVertices)
                         {
                             mesh->colors[i].push_back(AiColor4DToGfVector3f(assimpMesh->mColors[i][j]));
                         }
@@ -1011,7 +1098,7 @@ void AssimpImporter::PopulateAllMeshes(const aiScene* assimpScene, const StagePt
             mesh->uvs.resize(assimpMesh->GetNumUVChannels());
             mesh->colors.resize(assimpMesh->GetNumColorChannels());
             // Populate mesh details
-            for (size_t j = 0; j < assimpMesh->mNumVertices; j++)
+            for (size_t j : validVertices)
             {
                 mesh->points.push_back(AiVector3dToGfVector3f(assimpMesh->mVertices[j]) * scale);
             }
@@ -1020,11 +1107,11 @@ void AssimpImporter::PopulateAllMeshes(const aiScene* assimpScene, const StagePt
             for (size_t j = 0; j < assimpMesh->mNumFaces; j++)
             {
                 const aiFace& face = assimpMesh->mFaces[j];
-                if (face.mNumIndices >= 3)
+                if (validFaces[j] && face.mNumIndices >= 3)
                 {
                     for (size_t k = 0; k < face.mNumIndices; k++)
                     {
-                        mesh->faceVertexIndices.push_back(face.mIndices[k]);
+                        mesh->faceVertexIndices.push_back(vertexRemapping[face.mIndices[k]]);
                     }
                 }
             }
@@ -1033,7 +1120,7 @@ void AssimpImporter::PopulateAllMeshes(const aiScene* assimpScene, const StagePt
             for (size_t j = 0; j < assimpMesh->mNumFaces; j++)
             {
                 const aiFace& face = assimpMesh->mFaces[j];
-                if (face.mNumIndices >= 3)
+                if (validFaces[j] && face.mNumIndices >= 3)
                 {
                     for (size_t k = 0; k < face.mNumIndices; k++)
                     {
@@ -1056,6 +1143,7 @@ void AssimpImporter::PopulateAllMeshes(const aiScene* assimpScene, const StagePt
                     mesh->faceVertexCounts.push_back(face.mNumIndices);
                 }
             }
+            mesh->hasFaceVaryingNormals = !mesh->normals.empty();
 
             MeshGeomSubset subset;
             subset.faceIndices.resize(mesh->faceVertexCounts.size());
@@ -1075,7 +1163,25 @@ void AssimpImporter::PopulateAllMeshes(const aiScene* assimpScene, const StagePt
             std::iota(subset.faceIndices.begin(), subset.faceIndices.end(), 0);
             mesh->meshSubsets.push_back(subset);
         }
+        if (!isPointCloud && mesh->faceVertexCounts.empty() && preservePartialGeometry)
+        {
+            // A polygon mesh whose faces were skipped must not become a point cloud.
+            mesh->points.clear();
+        }
+        hasValidGeometry = hasValidGeometry || (isPointCloud ? !mesh->points.empty() : !mesh->faceVertexCounts.empty());
+        if (!mesh->points.empty())
+        {
+            mAssimpMeshIndices[i] = stage->meshes.size();
+            stage->meshes.push_back(mesh);
+        }
     }
+    if (skippedNonFiniteGeometry && !hasValidGeometry)
+    {
+        detailedError = "Asset " + mThreadContext->converterContext.GetImportAssetPath() +
+                        " contains non-finite vertex attribute values; no valid geometry remains after skipping corrupt elements.";
+        return false;
+    }
+    return true;
 }
 
 void AssimpImporter::PopulateStageTree(
@@ -1126,7 +1232,7 @@ void AssimpImporter::PopulateStageTree(
     for (size_t i = 0; i < currentNode->mNumMeshes; i++)
     {
         auto meshIndex = currentNode->mMeshes[i];
-        if (meshIndex > mAssimpMeshIndices.size() || mAssimpMeshIndices[meshIndex] == -1)
+        if (meshIndex >= mAssimpMeshIndices.size() || mAssimpMeshIndices[meshIndex] == size_t(-1))
         {
             continue;
         }
@@ -1329,14 +1435,16 @@ void AssimpImporter::ReadAnimationInformation(const aiScene* assimpScene, const 
             animation.fps = rawAnimation->mTicksPerSecond;
         }
 
-        double factor = FIXED_FPS / animation.fps;
-        auto keyFrames = (int)(animation.fps * rawAnimation->mDuration);
+        // Duration remains in source ticks. Additional sampling is bounded by
+        // the existing 24 FPS target, independently of source clock precision.
+        auto keyFrames = static_cast<size_t>(std::ceil(rawAnimation->mDuration));
         if (keyFrames > stage->maxKeyFrames)
         {
             stage->maxKeyFrames = keyFrames;
             stage->mutiplier = animation.fps / FIXED_FPS;
         }
-        animation.keyFrames = keyFrames;
+        animation.duration = rawAnimation->mDuration;
+        animation.keyFrames = static_cast<size_t>(std::ceil(rawAnimation->mDuration / std::max(1.0, animation.fps / FIXED_FPS))) + 1;
         stage->animationTracks.push_back(animation);
     }
 }
@@ -1357,41 +1465,47 @@ const aiNodeAnim* AssimpImporter::FindNodeAnim(const aiAnimation* animation, con
 
 int AssimpImporter::FindPosition(double animationTime, const aiNodeAnim* nodeAnim)
 {
-    for (size_t i = 1; i < nodeAnim->mNumPositionKeys; i++)
-    {
-        if (animationTime < nodeAnim->mPositionKeys[i].mTime)
+    const auto* keys = nodeAnim->mPositionKeys;
+    const auto* next = std::upper_bound(
+        keys,
+        keys + nodeAnim->mNumPositionKeys,
+        animationTime,
+        [](double time, const auto& key)
         {
-            return i - 1;
+            return time < key.mTime;
         }
-    }
-
-    return nodeAnim->mNumPositionKeys - 1;
+    );
+    return next == keys ? 0 : static_cast<int>(next - keys - 1);
 }
 
 int AssimpImporter::FindRotation(double animationTime, const aiNodeAnim* nodeAnim)
 {
-    for (size_t i = 1; i < nodeAnim->mNumRotationKeys; i++)
-    {
-        if (animationTime < nodeAnim->mRotationKeys[i].mTime)
+    const auto* keys = nodeAnim->mRotationKeys;
+    const auto* next = std::upper_bound(
+        keys,
+        keys + nodeAnim->mNumRotationKeys,
+        animationTime,
+        [](double time, const auto& key)
         {
-            return i - 1;
+            return time < key.mTime;
         }
-    }
-
-    return nodeAnim->mNumRotationKeys - 1;
+    );
+    return next == keys ? 0 : static_cast<int>(next - keys - 1);
 }
 
 int AssimpImporter::FindScaling(double animationTime, const aiNodeAnim* nodeAnim)
 {
-    for (size_t i = 1; i < nodeAnim->mNumScalingKeys; i++)
-    {
-        if (animationTime < nodeAnim->mScalingKeys[i].mTime)
+    const auto* keys = nodeAnim->mScalingKeys;
+    const auto* next = std::upper_bound(
+        keys,
+        keys + nodeAnim->mNumScalingKeys,
+        animationTime,
+        [](double time, const auto& key)
         {
-            return i - 1;
+            return time < key.mTime;
         }
-    }
-
-    return nodeAnim->mNumScalingKeys - 1;
+    );
+    return next == keys ? 0 : static_cast<int>(next - keys - 1);
 }
 
 TransformAnimationTracks AssimpImporter::GetNodeAnimation(
@@ -1405,7 +1519,7 @@ TransformAnimationTracks AssimpImporter::GetNodeAnimation(
     for (size_t i = 0; i < animTracks.size(); i++)
     {
         size_t keyFrames = animTracks[i].keyFrames;
-        TransformTimesamples nodeAnimation = GetNodeAnimationFrames(node, animTracks[i].fps, keyFrames, assimpScene->mAnimations[i], scale);
+        TransformTimesamples nodeAnimation = GetNodeAnimationFrames(node, keyFrames, assimpScene->mAnimations[i], scale);
         nodeAnimations.emplace_back(nodeAnimation);
     }
 
@@ -1429,43 +1543,63 @@ bool AssimpImporter::isBoneNode(const aiNode* node)
 }
 
 
-TransformTimesamples AssimpImporter::GetNodeAnimationFrames(const aiNode* node, size_t fps, size_t keyFrames, aiAnimation* animation, double scale)
+TransformTimesamples AssimpImporter::GetNodeAnimationFrames(const aiNode* node, size_t keyFrames, aiAnimation* animation, double scale)
 {
-    PXR_NS::VtVec3dArray t;
-    PXR_NS::VtVec3dArray s;
+    PXR_NS::VtVec3dArray t, s;
     PXR_NS::VtQuatdArray q;
-
-    std::string nodeName(node->mName.data);
-    const aiNodeAnim* nodeAnim = FindNodeAnim(animation, nodeName);
+    std::vector<double> translationTimes, rotationTimes, scaleTimes;
+    const aiNodeAnim* nodeAnim = FindNodeAnim(animation, node->mName.C_Str());
     if (nodeAnim)
     {
-        // Fixed 24fps per second.
-        double factor = FIXED_FPS / fps;
-        double frameTime = 1.0 / factor;
-        for (size_t j = 0; j < keyFrames; j++)
+        const double rate = animation->mTicksPerSecond > 0 ? animation->mTicksPerSecond : FIXED_FPS;
+        const double frameTime = std::max(1.0, rate / FIXED_FPS);
+        std::vector<double> times;
+        for (size_t j = 0; j < keyFrames; ++j)
         {
-            double currentTime = j / factor;
-            aiVector3D translation;
-            aiVector3D scaling;
+            times.push_back(std::min(j * frameTime, animation->mDuration));
+        }
+        // Retain authored keys even when they fall between the regular samples.
+        const auto appendKeys = [&](const auto* keys, unsigned count)
+        {
+            for (unsigned i = 0; i < count; ++i)
+            {
+                if (keys[i].mTime >= 0.0 && keys[i].mTime <= animation->mDuration)
+                {
+                    times.push_back(keys[i].mTime);
+                }
+            }
+        };
+        appendKeys(nodeAnim->mPositionKeys, nodeAnim->mNumPositionKeys);
+        appendKeys(nodeAnim->mRotationKeys, nodeAnim->mNumRotationKeys);
+        appendKeys(nodeAnim->mScalingKeys, nodeAnim->mNumScalingKeys);
+        std::sort(times.begin(), times.end());
+        times.erase(std::unique(times.begin(), times.end()), times.end());
+        for (double time : times)
+        {
+            aiVector3D translation, scaling;
             aiQuaternion rotation;
-            if (InterpolatedScaling(node, nodeAnim, currentTime, frameTime, scaling))
+            if (InterpolatedScaling(node, nodeAnim, time, frameTime, scaling))
             {
                 s.push_back(AiVector3dToGfVector3D(scaling));
+                scaleTimes.push_back(time);
             }
-
-            if (InterpolatedPosition(node, nodeAnim, currentTime, frameTime, translation))
+            if (InterpolatedPosition(node, nodeAnim, time, frameTime, translation))
             {
                 t.push_back(AiVector3dToGfVector3D(translation) * scale);
+                translationTimes.push_back(time);
             }
-
-            if (InterpolatedRotation(node, nodeAnim, currentTime, frameTime, rotation))
+            if (InterpolatedRotation(node, nodeAnim, time, frameTime, rotation))
             {
                 q.push_back(AiQuatenionToGfQuateniond(rotation));
+                rotationTimes.push_back(time);
             }
         }
     }
-
-    return TransformTimesamples(t, q, s);
+    TransformTimesamples samples(t, q, s);
+    samples.SetSampleTimes(std::move(translationTimes), TransformChannel::Translation);
+    samples.SetSampleTimes(std::move(rotationTimes), TransformChannel::Rotation);
+    samples.SetSampleTimes(std::move(scaleTimes), TransformChannel::Scale);
+    return samples;
 }
 
 bool AssimpImporter::InterpolatedPosition(
@@ -1485,12 +1619,14 @@ bool AssimpImporter::InterpolatedPosition(
     if (animationTime < nodeAnim->mPositionKeys[0].mTime)
     {
         translation = nodeAnim->mPositionKeys[0].mValue;
+        return true;
     }
 
     int position = FindPosition(animationTime, nodeAnim);
     if (position == nodeAnim->mNumPositionKeys - 1)
     {
         translation = nodeAnim->mPositionKeys[position].mValue;
+        return true;
     }
 
     int nextPosition = position + 1;
@@ -1517,12 +1653,14 @@ bool AssimpImporter::InterpolatedRotation(const aiNode* node, const aiNodeAnim* 
     if (animationTime < nodeAnim->mRotationKeys[0].mTime)
     {
         orient = nodeAnim->mRotationKeys[0].mValue;
+        return true;
     }
 
     int position = FindRotation(animationTime, nodeAnim);
     if (position == nodeAnim->mNumRotationKeys - 1)
     {
         orient = nodeAnim->mRotationKeys[position].mValue;
+        return true;
     }
 
     int nextPosition = position + 1;
@@ -1548,12 +1686,14 @@ bool AssimpImporter::InterpolatedScaling(const aiNode* node, const aiNodeAnim* n
     if (animationTime < nodeAnim->mScalingKeys[0].mTime)
     {
         scale = nodeAnim->mScalingKeys[0].mValue;
+        return true;
     }
 
     int position = FindScaling(animationTime, nodeAnim);
     if (position == nodeAnim->mNumScalingKeys - 1)
     {
         scale = nodeAnim->mScalingKeys[position].mValue;
+        return true;
     }
 
     int nextPosition = position + 1;

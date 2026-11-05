@@ -8,6 +8,7 @@
 #include "pxr_includes.h"
 #include "utils/utils.h"
 
+#include <algorithm>
 #include <chrono>
 #include <future>
 #include <iostream>
@@ -17,25 +18,59 @@
 OmniConverterFuture::~OmniConverterFuture()
 {
     Stop();
+    Wait();
 }
 
 void OmniConverterFuture::Start()
 {
     mContext->SetStatus(OmniConverterStatus::IN_PROGRESS);
     mContext->mThisFuture = this;
-    std::thread t(OmniConverterFuture::Convert, mContext);
-    t.detach();
+    mThread = std::thread(OmniConverterFuture::Convert, mContext);
 }
 
 void OmniConverterFuture::Stop()
 {
-    mContext->FinishProgress();
     mContext->Exit();
-    auto Status = GetStatus();
-    if (Status == OmniConverterStatus::IN_PROGRESS)
+    auto status = GetStatus();
+    if (status == OmniConverterStatus::IN_PROGRESS)
     {
         mContext->SetStatus(OmniConverterStatus::CANCELLED);
     }
+}
+
+void OmniConverterFuture::Wait()
+{
+    if (!mThread.joinable())
+    {
+        return;
+    }
+
+    if (mThread.get_id() == std::this_thread::get_id())
+    {
+        mThread.detach();
+        return;
+    }
+
+    mThread.join();
+}
+
+void OmniConverterFuture::Release()
+{
+    if (mThread.joinable() && mThread.get_id() == std::this_thread::get_id())
+    {
+        Stop();
+        auto worker = std::make_shared<std::thread>(std::move(mThread));
+        std::thread(
+            [this, worker]()
+            {
+                worker->join();
+                delete this;
+            }
+        ).detach();
+        return;
+    }
+
+    delete this;
 }
 
 OmniConverterStatus OmniConverterFuture::GetStatus() const
@@ -45,13 +80,43 @@ OmniConverterStatus OmniConverterFuture::GetStatus() const
 
 const std::string& OmniConverterFuture::GetDetailedError() const
 {
-    return mContext->GetDetailedError();
+    std::lock_guard<std::mutex> lock(mDetailedErrorSnapshotsMutex);
+    auto detailedError = mContext->GetDetailedError();
+    if (mDetailedErrorSnapshots.empty() || *mDetailedErrorSnapshots.back() != detailedError)
+    {
+        mDetailedErrorSnapshots.push_back(std::make_unique<std::string>(std::move(detailedError)));
+    }
+    return *mDetailedErrorSnapshots.back();
+}
+
+void OmniConverterFuture::SetCallbackError(const std::string& error)
+{
+    mContext->SetCallbackError(error);
+}
+
+void OmniConverterFuture::SetTemporaryOutputDirectory(const std::string& path)
+{
+    mContext->SetTemporaryOutputDirectory(path);
+}
+
+std::string OmniConverterFuture::GetTemporaryOutputDirectory() const
+{
+    return mContext->GetTemporaryOutputDirectory();
 }
 
 void OmniConverterFuture::Convert(std::shared_ptr<OmniConverterFuture::FutureThreadContext> context)
 {
     OmniConverterStatus status = OmniConverterStatus::OK;
     std::string detailedError;
+    const auto applyCallbackError = [&]()
+    {
+        const std::string callbackError = context->GetCallbackError();
+        if (!callbackError.empty() && status != OmniConverterStatus::CANCELLED && !context->IsExited())
+        {
+            detailedError = callbackError;
+            status = OmniConverterStatus::UNKNOWN;
+        }
+    };
 
     if (context->IsExited())
     {
@@ -105,6 +170,14 @@ void OmniConverterFuture::Convert(std::shared_ptr<OmniConverterFuture::FutureThr
         return;
     }
 
+    if (!context->converterContext.ValidateOutputPath(detailedError))
+    {
+        context->converterContext.Log(detailedError);
+        context->SetDetailedError(detailedError);
+        context->SetStatus(OmniConverterStatus::FILE_WRITE_ERROR);
+        return;
+    }
+
     // Output can be anonymous layer too so all imports will be in-memory.
     std::string baseOutPath = PathUtils::GetDirName(outputAssetPath);
     if (context->converterContext.IsInMemoryOutput())
@@ -122,7 +195,16 @@ void OmniConverterFuture::Convert(std::shared_ptr<OmniConverterFuture::FutureThr
     {
         detailedError = "Asset convert failed as dir " + baseOutPath + " cannot be created.";
         context->converterContext.Log(detailedError);
+        context->SetDetailedError(detailedError);
         context->SetStatus(OmniConverterStatus::DIRECTORY_CREATE_FAILED);
+        return;
+    }
+
+    if (!context->converterContext.CheckOutputReplaceable(detailedError))
+    {
+        context->converterContext.Log(detailedError);
+        context->SetDetailedError(detailedError);
+        context->SetStatus(OmniConverterStatus::FILE_WRITE_ERROR);
         return;
     }
 
@@ -189,6 +271,7 @@ void OmniConverterFuture::Convert(std::shared_ptr<OmniConverterFuture::FutureThr
     if (!cached)
     {
         auto importedStage = importer->ImportStage(context, status, detailedError);
+        applyCallbackError();
         auto endImportTime = std::chrono::system_clock::now();
         auto importCost = std::chrono::duration_cast<std::chrono::seconds>(endImportTime - startImportTime).count();
         context->converterContext.Log("Costs " + std::to_string(importCost) + "s for importer to import asset.");
@@ -197,15 +280,65 @@ void OmniConverterFuture::Convert(std::shared_ptr<OmniConverterFuture::FutureThr
 
         if (importedStage && status == OmniConverterStatus::OK)
         {
-            if (context->converterContext.MergeAllMeshes())
-            {
-                StageUtils::MergeMeshes(importedStage, "mesh");
-            }
-
             if (!StageUtils::CleanupMeshes(importedStage, detailedError))
             {
                 context->converterContext.Log("ERROR: " + detailedError);
                 status = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
+            }
+
+            if (status == OmniConverterStatus::OK && context->converterContext.SmoothNormals())
+            {
+                for (const auto& mesh : importedStage->meshes)
+                {
+                    if (!StageUtils::GenerateSmoothNormals(mesh))
+                    {
+                        detailedError = "Failed to generate smooth normals";
+                        context->converterContext.Log("ERROR: " + detailedError);
+                        status = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
+                        break;
+                    }
+                }
+            }
+
+            if (status == OmniConverterStatus::OK && context->converterContext.MergeAllMeshes())
+            {
+                StageUtils::MergeMeshes(importedStage, "mesh");
+                if (!StageUtils::CleanupMeshes(importedStage, detailedError))
+                {
+                    context->converterContext.Log("ERROR: " + detailedError);
+                    status = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
+                }
+            }
+
+            if (status == OmniConverterStatus::OK && importedStage->hasSkippedCorruptGeometry)
+            {
+                const auto hasMeshPoints = [&importedStage](size_t index)
+                {
+                    return index < importedStage->meshes.size() && !importedStage->meshes[index]->points.empty();
+                };
+                bool hasGeometry = false;
+                StageUtils::TraverseStageTree(
+                    importedStage->rootNode,
+                    [&](const StageNodePtr& node)
+                    {
+                        hasGeometry = hasGeometry || std::any_of(node->staticMeshInstances.begin(), node->staticMeshInstances.end(), hasMeshPoints);
+                        return !hasGeometry;
+                    }
+                );
+                hasGeometry = hasGeometry || std::any_of(
+                                                 importedStage->skinMeshes.begin(),
+                                                 importedStage->skinMeshes.end(),
+                                                 [&hasMeshPoints](const SkinMeshPtr& skinMesh)
+                                                 {
+                                                     return hasMeshPoints(skinMesh->meshIndex);
+                                                 }
+                                             );
+                if (!hasGeometry)
+                {
+                    detailedError = "Asset " + importAssetPath + " contains corrupt geometry; no valid geometry remains after cleanup.";
+                    context->converterContext.Log("ERROR: " + detailedError);
+                    status = OmniConverterStatus::INCOMPLETE_IMPORT_FORMAT;
+                }
             }
 
             // Creates root node always
@@ -228,13 +361,19 @@ void OmniConverterFuture::Convert(std::shared_ptr<OmniConverterFuture::FutureThr
 
     context->converterContext.clear();
     context->FinishProgress();
+    applyCallbackError();
     context->SetDetailedError(detailedError);
     context->SetStatus(status);
 }
 
 void OmniConverterFuture::FutureThreadContext::SetStatus(OmniConverterStatus status)
 {
+    std::lock_guard<std::mutex> exitLock(mExitMutex);
     std::lock_guard<std::mutex> lock(mStatusMutex);
+    if (mExited && status != OmniConverterStatus::CANCELLED)
+    {
+        return;
+    }
     mCurrentStatus = status;
 }
 
@@ -250,54 +389,109 @@ void OmniConverterFuture::FutureThreadContext::SetDetailedError(const std::strin
     mDetailedError = error;
 }
 
-const std::string& OmniConverterFuture::FutureThreadContext::GetDetailedError()
+std::string OmniConverterFuture::FutureThreadContext::GetDetailedError()
 {
     std::lock_guard<std::mutex> lock(mStatusMutex);
     return mDetailedError;
 }
 
+void OmniConverterFuture::FutureThreadContext::SetCallbackError(const std::string& error)
+{
+    std::lock_guard<std::mutex> lock(mStatusMutex);
+    if (mCallbackError.empty())
+    {
+        mCallbackError = error;
+    }
+}
+
+std::string OmniConverterFuture::FutureThreadContext::GetCallbackError()
+{
+    std::lock_guard<std::mutex> lock(mStatusMutex);
+    return mCallbackError;
+}
+
+void OmniConverterFuture::FutureThreadContext::SetTemporaryOutputDirectory(const std::string& path)
+{
+    std::lock_guard<std::mutex> lock(mStatusMutex);
+    mTemporaryOutputDirectory = path;
+}
+
+std::string OmniConverterFuture::FutureThreadContext::GetTemporaryOutputDirectory()
+{
+    std::lock_guard<std::mutex> lock(mStatusMutex);
+    return mTemporaryOutputDirectory;
+}
+
 bool OmniConverterFuture::FutureThreadContext::MaterialLoader(OmniConverterMaterialDescription* material)
 {
-    std::lock_guard<std::mutex> lock(mExitMutex);
-    if (!mExited)
+    OmniConverterFuture* future = nullptr;
     {
-        return converterContext.LoadMaterial(mThisFuture, material);
+        std::lock_guard<std::mutex> lock(mExitMutex);
+        if (mExited)
+        {
+            return false;
+        }
+        future = mThisFuture;
     }
 
-    return false;
+    return converterContext.LoadMaterial(future, material);
 }
 
 void OmniConverterFuture::FutureThreadContext::StartProgress(uint32_t totalSteps)
 {
-    std::lock_guard<std::mutex> lock(mExitMutex);
-    if (!mExited)
+    OmniConverterFuture* future = nullptr;
     {
+        std::lock_guard<std::mutex> lock(mExitMutex);
+        if (mExited)
+        {
+            return;
+        }
         mTotalSteps = totalSteps;
-        converterContext.ReportProgress(mThisFuture, 0, mTotalSteps);
+        future = mThisFuture;
     }
+
+    converterContext.ReportProgress(future, 0, totalSteps);
 }
 
 void OmniConverterFuture::FutureThreadContext::IncrementProgress(uint32_t steps)
 {
-    std::lock_guard<std::mutex> lock(mExitMutex);
-    if (!mExited)
+    OmniConverterFuture* future = nullptr;
+    uint32_t currentProgress = 0;
+    uint32_t totalSteps = 0;
     {
+        std::lock_guard<std::mutex> lock(mExitMutex);
+        if (mExited)
+        {
+            return;
+        }
         mCurrentProgress += steps;
         if (mCurrentProgress > mTotalSteps)
         {
             mCurrentProgress = mTotalSteps;
         }
-        converterContext.ReportProgress(mThisFuture, mCurrentProgress, mTotalSteps);
+        future = mThisFuture;
+        currentProgress = mCurrentProgress;
+        totalSteps = mTotalSteps;
     }
+
+    converterContext.ReportProgress(future, currentProgress, totalSteps);
 }
 
 void OmniConverterFuture::FutureThreadContext::FinishProgress()
 {
-    std::lock_guard<std::mutex> lock(mExitMutex);
-    if (!mExited)
+    OmniConverterFuture* future = nullptr;
+    uint32_t totalSteps = 0;
     {
-        converterContext.ReportProgress(mThisFuture, mTotalSteps, mTotalSteps);
+        std::lock_guard<std::mutex> lock(mExitMutex);
+        if (mExited)
+        {
+            return;
+        }
+        future = mThisFuture;
+        totalSteps = mTotalSteps;
     }
+
+    converterContext.ReportProgress(future, totalSteps, totalSteps);
 }
 
 bool OmniConverterFuture::FutureThreadContext::IsExited()
@@ -310,4 +504,5 @@ void OmniConverterFuture::FutureThreadContext::Exit()
 {
     std::lock_guard<std::mutex> lock(mExitMutex);
     mExited = true;
+    mThisFuture = nullptr;
 }

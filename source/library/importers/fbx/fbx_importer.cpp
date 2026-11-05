@@ -1068,6 +1068,7 @@ MeshPtr FbxSdkImporter::PopulateMeshInternal(fbxsdk::FbxScene* scene, fbxsdk::Fb
     {
         mesh->normals.push_back(FbxVector4dToGfVector3f(faceNormals[i]));
     }
+    mesh->hasFaceVaryingNormals = !mesh->normals.empty();
 
     fbxsdk::FbxStringList fbxUVSetNames;
     fbxMesh->GetUVSetNames(fbxUVSetNames);

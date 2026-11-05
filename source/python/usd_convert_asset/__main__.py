@@ -2,6 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0 AND CC-BY-4.0
 #
 
-from .cli import main
+from .cli import process_main
 
-raise SystemExit(main())
+raise SystemExit(process_main())

@@ -130,27 +130,15 @@ function version_compare(version, target)
     return 0
 end
 
-function version_at_least(version, target)
-    return version_compare(version, target) >= 0
-end
-
 function version_greater_than(version, target)
     return version_compare(version, target) > 0
 end
 
 function use_draco()
-    -- USD 24.05/25.02 linux-aarch64 already carries Draco through USD. Linking external
-    -- Draco there loads duplicate global symbols and can cause invalid-pointer crashes.
-    filter {"system:linux", "platforms:x86_64" }
+    filter { "system:linux" }
         externalincludedirs { target_deps.."/draco/%{cfg.buildcfg}/include"}
         libdirs { target_deps.."/draco/%{cfg.buildcfg}/lib"}
         links { "draco" }
-    filter {"system:linux", "platforms:aarch64" }
-        if version_at_least(USD_VERSION, "25.11") then
-            externalincludedirs { target_deps.."/draco/%{cfg.buildcfg}/include"}
-            libdirs { target_deps.."/draco/%{cfg.buildcfg}/lib"}
-            links { "draco" }
-        end
     filter { "system:windows" }
         externalincludedirs { target_deps.."/draco/%{cfg.buildcfg}/include"}
         libdirs { target_deps.."/draco/%{cfg.buildcfg}/lib"}
@@ -227,7 +215,10 @@ function use_sha1()
     externalincludedirs { target_deps.."/sha1" }
 end
 
-function use_python()
+-- @param skip_libpython_link: when true, don't link libpython on Linux. Used for the libraries
+--   shipped in the pip wheel, which resolve Python symbols from the host interpreter at load
+--   time instead of bundling/needing a libpython shared library.
+function use_python(skip_libpython_link)
     python_folder = target_deps.."/python"
 
     filter { "system:windows" }
@@ -236,7 +227,9 @@ function use_python()
     filter { "system:linux" }
         externalincludedirs { python_folder.."/include/python"..PYTHON_VERSION }
         syslibdirs { python_folder.."/lib" }
-        links { "python"..PYTHON_VERSION }
+        if not skip_libpython_link then
+            links { "python"..PYTHON_VERSION }
+        end
     filter {}
 end
 
@@ -516,7 +509,7 @@ project "converter_library"
     use_tinygltf()
     use_tinyobjloader()
     use_sha1()
-    use_python()
+    use_python(true)
 
     -- to do: address the warnings if possible
     filter { "system:windows" }
@@ -683,7 +676,7 @@ project "usd_convert_asset_bindings"
 
     dependson { "converter_library" }
     use_pybind()
-    use_python()
+    use_python(true)
 
     filter { "system:linux" }
         if _OPTIONS["enable-gcov"] then
@@ -729,25 +722,16 @@ project "usd_convert_asset_bindings"
         }
     )
 
-    -- USD 24.05/25.02 linux-aarch64 already carries Draco through USD. Packaging external
-    -- Draco there loads duplicate global symbols and can cause invalid-pointer crashes.
     filter { "system:windows" }
         repo_build.prebuild_copy({
             {target_deps.."/draco/$config/bin/${lib_prefix}draco*${lib_ext}*", bindings_libs_dir},
             {target_deps.."/draco/$config/lib/${lib_prefix}draco*${lib_ext}*", bindings_libs_dir},
         })
-    filter { "system:linux", "platforms:x86_64" }
+    filter { "system:linux" }
         repo_build.prebuild_copy({
             {target_deps.."/draco/$config/bin/${lib_prefix}draco*${lib_ext}*", bindings_libs_dir},
             {target_deps.."/draco/$config/lib/${lib_prefix}draco*${lib_ext}*", bindings_libs_dir},
         })
-    filter { "system:linux", "platforms:aarch64" }
-        if version_at_least(USD_VERSION, "25.11") then
-            repo_build.prebuild_copy({
-                {target_deps.."/draco/$config/bin/${lib_prefix}draco*${lib_ext}*", bindings_libs_dir},
-                {target_deps.."/draco/$config/lib/${lib_prefix}draco*${lib_ext}*", bindings_libs_dir},
-            })
-        end
     filter {}
 
     filter { "system:windows" }
@@ -759,9 +743,9 @@ project "usd_convert_asset_bindings"
 project "usd_convert_asset_usd_plugin"
 
     dependson { "converter_library" }
-    use_usd ({"arch", "sdf", "tf", "usd"})
+    use_usd ({"arch", "sdf", "tf", "usd", "vt"})
     use_pybind()
-    use_python()
+    use_python(true)
 
     filter {"system:linux" }
         linkoptions { "-Wl,-rpath,'$$ORIGIN'", "-Wl,-shared" }

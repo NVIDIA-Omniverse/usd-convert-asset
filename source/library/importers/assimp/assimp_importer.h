@@ -20,7 +20,7 @@ private:
     std::vector<std::string> PopulateAllTextures(const StagePtr& stage, const aiScene* assimpScene);
     void PopulateAllCameras(const aiScene* scene, const StagePtr& stage);
     void PopulateAllMaterials(const aiScene* assimpScene, const StagePtr& stage);
-    void PopulateAllMeshes(const aiScene* assimpScene, const StagePtr& stage, double scale);
+    bool PopulateAllMeshes(const aiScene* assimpScene, const StagePtr& stage, double scale, std::string& detailedError);
     void PopulateStageTree(
         const aiScene* scene,
         const aiNode* currentNode,
@@ -60,7 +60,7 @@ private:
         double scale
     );
 
-    TransformTimesamples GetNodeAnimationFrames(const aiNode* node, size_t fps, size_t keyFrames, aiAnimation* animation, double scale);
+    TransformTimesamples GetNodeAnimationFrames(const aiNode* node, size_t keyFrames, aiAnimation* animation, double scale);
 
     bool InterpolatedPosition(const aiNode* node, const aiNodeAnim* nodeAnim, double animationTime, double frameTime, aiVector3D& translation);
     bool InterpolatedRotation(const aiNode* node, const aiNodeAnim* nodeAnim, double animationTime, double frameTime, aiQuaternion& orient);

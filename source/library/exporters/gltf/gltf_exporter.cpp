@@ -170,7 +170,9 @@ void CreateAnimationChannel(
     const PXR_NS::VtArray<ValueType>& values,
     double frameStep,
     size_t frameCount,
-    double startTime = 0.0
+    double startTime = 0.0,
+    const TransformTimesamples* transformSamples = nullptr,
+    TransformChannel channel = TransformChannel::Translation
 )
 {
     if (values.empty())
@@ -198,6 +200,14 @@ void CreateAnimationChannel(
             return (float)value;
         }
     );
+
+    if (transformSamples)
+    {
+        for (size_t i = 0; i < times.size(); ++i)
+        {
+            times[i] = static_cast<float>(transformSamples->GetSampleTime(i, channel) * frameStep);
+        }
+    }
 
     animationSampler.input = CreateAccessor(model, times, "Animation Frame Times", false, 0, { 0.0 }, { times.back() });
 
@@ -1585,9 +1595,41 @@ void GltfExporter::CreateTransformAnimationChannels(
         }
     );
 
-    CreateAnimationChannel(model, animationTrack, nodeIndex, "translation", floatTranslations, frameStep, floatTranslations.size());
-    CreateAnimationChannel(model, animationTrack, nodeIndex, "scale", floatScales, frameStep, floatScales.size());
-    CreateAnimationChannel(model, animationTrack, nodeIndex, "rotation", floatRotations, frameStep, floatRotations.size());
+    CreateAnimationChannel(
+        model,
+        animationTrack,
+        nodeIndex,
+        "translation",
+        floatTranslations,
+        frameStep,
+        floatTranslations.size(),
+        0.0,
+        &transformTimesamples
+    );
+    CreateAnimationChannel(
+        model,
+        animationTrack,
+        nodeIndex,
+        "scale",
+        floatScales,
+        frameStep,
+        floatScales.size(),
+        0.0,
+        &transformTimesamples,
+        TransformChannel::Scale
+    );
+    CreateAnimationChannel(
+        model,
+        animationTrack,
+        nodeIndex,
+        "rotation",
+        floatRotations,
+        frameStep,
+        floatRotations.size(),
+        0.0,
+        &transformTimesamples,
+        TransformChannel::Rotation
+    );
 }
 
 void GltfExporter::CreatePointCacheAnimationChannel(tinygltf::Model& model, size_t nodeIndex, size_t meshIndex, const StagePtr& stage)

@@ -4,6 +4,7 @@
 #include "assimp_exporter.h"
 
 #include "../../common/common.h"
+#include "../../utils/stage_utils.h"
 #include "../../utils/utils.h"
 #include "assimp/cexport.h"
 #include "assimp/cfileio.h"
@@ -13,8 +14,11 @@
 #include "assimp/scene.h"
 #include "assimp_exporter.h"
 
+#include <pxr/usd/usdSkel/utils.h>
+
 #include <algorithm>
 #include <numeric>
+#include <unordered_set>
 
 #define ENSURE_STATUS_OK(status)                                                                                                                     \
     {                                                                                                                                                \
@@ -27,6 +31,87 @@
 
 const static std::string MATERIAL_DIR_NAME = "materials";
 const static std::string TEXTURE_DIR_NAME = "textures";
+
+// Bake the rest pose per vertex: a child joint can cancel its root's movement,
+// and blended vertices need contributions from every influencing joint.
+static MeshPtr BakeSkinRestPose(const MeshPtr& source, const SkinMeshPtr& skin)
+{
+    auto mesh = std::make_shared<Mesh>(*source);
+    std::vector<PXR_NS::GfMatrix4d> transforms;
+    std::vector<PXR_NS::GfMatrix3d> normalTransforms;
+    for (const auto& bone : skin->influencedBoneNodes)
+    {
+        if (!bone)
+        {
+            return nullptr;
+        }
+        auto rest = bone->restTransform;
+        auto parent = bone->parent.lock();
+        while (parent && parent->isBoneNode)
+        {
+            rest *= parent->restTransform;
+            parent = parent->parent.lock();
+        }
+        if (parent)
+        {
+            rest *= parent->worldTransformMatrix;
+        }
+        const auto transform = bone->bindTransform.GetInverse() * rest;
+        transforms.push_back(transform);
+        normalTransforms.push_back(transform.ExtractRotationMatrix().GetInverse().GetTranspose());
+    }
+    const auto normalBind = skin->geomBindTransform.ExtractRotationMatrix().GetInverse().GetTranspose();
+    if (transforms.empty() || skin->numBoneInfluencesPerVertex == 0)
+    {
+        // Unbound skin data still has a useful geometry placement.
+        for (auto& point : mesh->points)
+        {
+            point = PXR_NS::GfVec3f(skin->geomBindTransform.Transform(point));
+        }
+        for (auto& normal : mesh->normals)
+        {
+            normal = PXR_NS::GfVec3f((normal * normalBind).GetNormalized());
+        }
+        return mesh;
+    }
+    if (!PXR_NS::UsdSkelSkinPointsLBS(
+            skin->geomBindTransform,
+            transforms,
+            skin->jointInfluences,
+            skin->jointWeights,
+            skin->numBoneInfluencesPerVertex,
+            mesh->points
+        ))
+    {
+        return nullptr;
+    }
+    if (!mesh->normals.empty())
+    {
+        const bool faceVarying = mesh->hasFaceVaryingNormals || mesh->normals.size() != mesh->points.size();
+        const bool success = faceVarying ? PXR_NS::UsdSkelSkinFaceVaryingNormalsLBS(
+                                               normalBind,
+                                               normalTransforms,
+                                               skin->jointInfluences,
+                                               skin->jointWeights,
+                                               skin->numBoneInfluencesPerVertex,
+                                               mesh->faceVertexIndices,
+                                               mesh->normals
+                                           ) :
+                                           PXR_NS::UsdSkelSkinNormalsLBS(
+                                               normalBind,
+                                               normalTransforms,
+                                               skin->jointInfluences,
+                                               skin->jointWeights,
+                                               skin->numBoneInfluencesPerVertex,
+                                               mesh->normals
+                                           );
+        if (!success)
+        {
+            return nullptr;
+        }
+    }
+    return mesh;
+}
 
 static aiVector3D GfVec3fToAiVector3D(const PXR_NS::GfVec3f& vec3)
 {
@@ -193,6 +278,14 @@ OmniConverterStatus AssimpExporter::Export(const StagePtr& stage, std::string& d
     mExportContext->StartProgress(totalSteps);
 
     ENSURE_STATUS_OK(ExportTextures(stage, detailedError));
+    if (!stage->skinMeshes.empty())
+    {
+        Log("WARNING: Assimp export preserves skinned geometry in its rest pose, but does not export skin bindings.");
+    }
+    if (!mExportContext->converterContext.IgnoreAnimations() && !stage->animationTracks.empty())
+    {
+        Log("WARNING: Assimp export does not preserve animation; exporting static geometry.");
+    }
     PreprocessAllNodes(stage, stage->rootNode);
     auto assimpScene = ToAiScene(stage, detailedError);
     if (!assimpScene)
@@ -397,7 +490,7 @@ OmniConverterStatus AssimpExporter::Export(const StagePtr& stage, std::string& d
     {
         if (!UploadContent(blobs.first, blobs.second.get()))
         {
-            detailedError = "Failed to write file " + blobs.first;
+            detailedError = (formatId == "fbx" ? "Failed to write FBX file " : "Failed to write file ") + blobs.first;
             return OmniConverterStatus::FILE_WRITE_ERROR;
         }
     }
@@ -424,7 +517,7 @@ OmniConverterStatus AssimpExporter::ExportTextures(const StagePtr& stage, std::s
         }
 
         TextureImagePtr texture = stage->images[i];
-        UploadTextureIfNotEmpty(texture, detailedError);
+        ENSURE_STATUS_OK(UploadTextureIfNotEmpty(texture, detailedError));
         ClearInMemoryTexture(texture);
         mExportContext->IncrementProgress();
     }
@@ -438,14 +531,19 @@ OmniConverterStatus AssimpExporter::UploadTextureIfNotEmpty(const TextureImagePt
     {
         const std::string& filename = PathUtils::GetFileName(texture->originalPath, true);
         const std::string& targetPath = PathUtils::JoinPaths(mTexturesExportRoot, filename);
+        if (!UploadContent(targetPath, texture->blob.get()))
+        {
+            detailedError = "Failed to write texture file " + targetPath + ".";
+            Log(detailedError);
+            return OmniConverterStatus::FILE_WRITE_ERROR;
+        }
         mUploadedFiles[texture->originalPath] = targetPath;
-        UploadContent(targetPath, texture->blob.get());
         mTextureUploadPath[texture] = targetPath;
         mExportContext->IncrementProgress();
     }
     else
     {
-        UploadFileInternal(texture->realPath, mTexturesExportRoot, detailedError);
+        ENSURE_STATUS_OK(UploadFileInternal(texture->realPath, mTexturesExportRoot, detailedError));
         mTextureUploadPath[texture] = mUploadedFiles[texture->realPath];
     }
 
@@ -459,13 +557,13 @@ OmniConverterStatus AssimpExporter::UploadFileInternal(const std::string& filePa
     {
         const std::string& fileName = PathUtils::GetFileName(filePath, true);
         const std::string& outFilePath = PathUtils::JoinPaths(targetDir, fileName);
-        mUploadedFiles[filePath] = outFilePath;
         if (!mExportContext->converterContext.CopyFile(outFilePath, filePath))
         {
             detailedError = "Failed to copy file " + filePath + " to " + outFilePath + ".";
             Log(detailedError);
-            return OmniConverterStatus::CANCELLED;
+            return OmniConverterStatus::FILE_WRITE_ERROR;
         }
+        mUploadedFiles[filePath] = outFilePath;
     }
     mExportContext->IncrementProgress();
 
@@ -682,6 +780,7 @@ aiTexture* AssimpExporter::ToAiTexture(const TextureImagePtr& texture)
 std::vector<aiMesh*> AssimpExporter::ToAiMesh(const MeshPtr& mesh)
 {
     std::vector<aiMesh*> meshes;
+    const bool hasFaceVaryingNormals = mesh->hasFaceVaryingNormals || (!mesh->normals.empty() && mesh->normals.size() != mesh->points.size());
     for (const auto& subset : mesh->meshSubsets)
     {
         aiMesh* assimpMesh = new aiMesh;
@@ -762,7 +861,8 @@ std::vector<aiMesh*> AssimpExporter::ToAiMesh(const MeshPtr& mesh)
                 assimpMesh->mVertices[vertexIndex] = point;
                 if (!mesh->normals.empty())
                 {
-                    const auto& normal = GfVec3fToAiVector3D(mesh->normals[j]);
+                    const size_t normalIndex = hasFaceVaryingNormals ? j : static_cast<size_t>(faceVertexIndex);
+                    const auto& normal = GfVec3fToAiVector3D(mesh->normals[normalIndex]);
                     assimpMesh->mNormals[vertexIndex] = normal;
                 }
                 assimpMesh->mFaces[i].mIndices[j - start] = vertexIndex;
@@ -810,12 +910,44 @@ std::shared_ptr<aiScene> AssimpExporter::ToAiScene(const StagePtr& stage, std::s
 {
     auto assimpScene = std::shared_ptr<aiScene>(new aiScene, ReleaseAiScene);
 
+    mMeshIndices.clear();
+    mMirroredMeshIndices.clear();
     std::vector<aiMesh*> allMeshes;
     std::vector<std::string> skippedMeshNames;
     bool isSTLExport = mExportContext->converterContext.GetOutputAssetType() == AssetType::STL;
 
-    for (const auto& mesh : stage->meshes)
+    // Keep a separate baked mesh per binding, without changing shared static geometry.
+    std::unordered_set<size_t> skinMeshIndices;
+    for (const auto& skin : stage->skinMeshes)
     {
+        skinMeshIndices.insert(skin->meshIndex);
+    }
+    std::vector<StageNodePtr> nodes;
+    if (!skinMeshIndices.empty())
+    {
+        nodes.push_back(stage->rootNode);
+    }
+    while (!nodes.empty())
+    {
+        const auto node = nodes.back();
+        nodes.pop_back();
+        if (node)
+        {
+            for (const auto index : node->staticMeshInstances)
+            {
+                skinMeshIndices.erase(index);
+            }
+            nodes.insert(nodes.end(), node->children.begin(), node->children.end());
+        }
+    }
+
+    for (size_t meshIndex = 0; meshIndex < stage->meshes.size(); ++meshIndex)
+    {
+        if (skinMeshIndices.count(meshIndex))
+        {
+            continue;
+        }
+        const auto& mesh = stage->meshes[meshIndex];
         if (mExportContext->IsExited())
         {
             return nullptr;
@@ -833,6 +965,71 @@ std::shared_ptr<aiScene> AssimpExporter::ToAiScene(const StagePtr& stage, std::s
         std::vector<size_t> indices(meshes.size());
         std::iota(indices.begin(), indices.end(), allMeshes.size() - meshes.size());
         mMeshIndices[mesh] = indices;
+    }
+
+    if (mExportContext->converterContext.GetOutputAssetType() == AssetType::OBJ)
+    {
+        StageUtils::TraverseStageTree(
+            stage->rootNode,
+            [&](const StageNodePtr& node)
+            {
+                if (node->worldTransformMatrix.GetDeterminant() < 0)
+                {
+                    for (const auto index : node->staticMeshInstances)
+                    {
+                        const auto& mesh = stage->meshes[index];
+                        if (mMirroredMeshIndices.count(mesh))
+                        {
+                            continue;
+                        }
+                        auto meshes = ToAiMesh(mesh);
+                        auto& indices = mMirroredMeshIndices[mesh];
+                        for (auto* mirrored : meshes)
+                        {
+                            for (unsigned face = 0; face < mirrored->mNumFaces; ++face)
+                            {
+                                auto& polygon = mirrored->mFaces[face];
+                                std::reverse(polygon.mIndices, polygon.mIndices + polygon.mNumIndices);
+                            }
+                            indices.push_back(allMeshes.size());
+                            allMeshes.push_back(mirrored);
+                        }
+                    }
+                }
+                return true;
+            }
+        );
+    }
+
+    std::vector<std::vector<size_t>> skinIndices;
+    for (const auto& skin : stage->skinMeshes)
+    {
+        if (mExportContext->IsExited())
+        {
+            for (auto* mesh : allMeshes)
+            {
+                delete mesh;
+            }
+            return nullptr;
+        }
+        skinIndices.emplace_back();
+        const auto& source = stage->meshes[skin->meshIndex];
+        if (isSTLExport && !HasOnlyTriangularFaces(source))
+        {
+            skippedMeshNames.push_back(source->name);
+            continue;
+        }
+        const auto mesh = BakeSkinRestPose(source, skin);
+        if (!mesh)
+        {
+            Log("WARNING: Skipping skinned mesh with invalid joint influences: " + source->name);
+            continue;
+        }
+        const auto meshes = ToAiMesh(mesh);
+        auto& indices = skinIndices.back();
+        indices.resize(meshes.size());
+        std::iota(indices.begin(), indices.end(), allMeshes.size());
+        allMeshes.insert(allMeshes.end(), meshes.begin(), meshes.end());
     }
 
     // Log warnings and handle errors for STL export validation
@@ -892,12 +1089,11 @@ std::shared_ptr<aiScene> AssimpExporter::ToAiScene(const StagePtr& stage, std::s
         assimpScene->mMaterials = nullptr;
     }
 
-    // Add dummy material for STL export if needed (required by Assimp's PretransformVertices step)
-    // This must run even when IgnoreMaterials() is true, because STL export requires at least one material
-    // TODO: If PLY export is supported, this should also be executed.
-    if (isSTLExport)
+    // STL preprocessing and the FBX writer require a material table, including
+    // for untextured meshes and when IgnoreMaterials() is enabled.
+    if (isSTLExport || mExportContext->converterContext.GetOutputAssetType() == AssetType::FBX)
     {
-        AddDummyMaterialForSTL(assimpScene.get());
+        AddDefaultMaterialIfEmpty(assimpScene.get());
     }
 
     if (allMeshes.size() > 0)
@@ -921,17 +1117,36 @@ std::shared_ptr<aiScene> AssimpExporter::ToAiScene(const StagePtr& stage, std::s
         assimpScene->mRootNode = new aiNode;
     }
 
+    // Skinned meshes have no static instances. Preserve their rest-pose geometry
+    // in formats handled by Assimp even though this exporter has no skin support.
+    for (size_t i = 0; i < stage->skinMeshes.size(); ++i)
+    {
+        const auto& mesh = stage->meshes[stage->skinMeshes[i]->meshIndex];
+        PXR_NS::GfMatrix4d transform(1.0);
+        const auto& indices = skinIndices[i];
+        if (indices.empty())
+        {
+            continue;
+        }
+        auto node = new aiNode(mesh->name);
+        if (rootNode)
+        {
+            transform *= stage->rootNode->worldTransformMatrix.GetInverse();
+        }
+        node->mTransformation = GfMatrixToAiMatrix(transform);
+        node->mNumMeshes = indices.size();
+        node->mMeshes = new unsigned int[indices.size()];
+        std::copy(indices.begin(), indices.end(), node->mMeshes);
+        assimpScene->mRootNode->addChildren(1, &node);
+    }
+
     return assimpScene;
 }
 
-void AssimpExporter::AddDummyMaterialForSTL(aiScene* assimpScene)
+void AssimpExporter::AddDefaultMaterialIfEmpty(aiScene* assimpScene)
 {
-    // WORKAROUND: Assimp's PretransformVertices post-processing step (enforced for STL export)
-    // iterates through pScene->mNumMaterials to group meshes by material. If mNumMaterials is 0,
-    // the loop never executes, no meshes are processed, and a DeadlyImportError is thrown.
-    // See: assimp/code/PostProcessing/PretransformVertices.cpp:491-538
-    // This dummy material ensures the loop executes at least once, allowing meshes to be processed.
-    // The dummy material is not used by STL format (which doesn't support materials), so its contents don't matter.
+    // Assimp requires at least one material for STL preprocessing and FBX mesh
+    // export. Unbound meshes already use the default aiMesh material index (0).
     if (assimpScene->mNumMaterials == 0)
     {
         // Always allocate a new array when creating the dummy material
@@ -957,10 +1172,12 @@ void AssimpExporter::PopulateStageNodeTree(const StagePtr& stage, const StageNod
     node->mTransformation = GfMatrixToAiMatrix(currentNode->localTransform.GetMatrix());
 
     std::vector<size_t> allMeshIndices;
+    const bool mirrored = mExportContext->converterContext.GetOutputAssetType() == AssetType::OBJ &&
+                          currentNode->worldTransformMatrix.GetDeterminant() < 0;
     for (size_t i = 0; i < currentNode->staticMeshInstances.size(); i++)
     {
         const auto& mesh = stage->meshes[currentNode->staticMeshInstances[i]];
-        const auto& meshIndices = mMeshIndices[mesh];
+        const auto& meshIndices = mirrored ? mMirroredMeshIndices[mesh] : mMeshIndices[mesh];
         std::copy(meshIndices.begin(), meshIndices.end(), std::back_inserter(allMeshIndices));
     }
 

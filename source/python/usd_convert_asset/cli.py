@@ -12,7 +12,7 @@ import os
 import signal
 import sys
 import threading
-from contextlib import nullcontext
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -20,15 +20,42 @@ from usd_convert_asset import usdz
 
 _SUPPORTED_INPUT_EXTENSIONS = (".fbx", ".obj", ".gltf", ".glb", ".stl", ".ply")
 _SUPPORTED_OUTPUT_EXTENSIONS = (".usd", ".usda", ".usdc", ".usdz")
+_WINDOWS_MAX_PATH = usdz.WINDOWS_MAX_PATH
 
-# Windows STATUS_CONTROL_C_EXIT. POSIX uses conventional 128+SIGINT.
-_INTERRUPT_EXIT_CODE = 0xC000013A if sys.platform == "win32" else 130
+# Windows STATUS_CONTROL_C_EXIT as a signed 32-bit value for SystemExit.
+# POSIX uses conventional 128+SIGINT.
+_INTERRUPT_EXIT_CODE = -1073741510 if sys.platform == "win32" else 130
 
 _interrupt_requested = False
+_success_committed = False
 _interrupt_lock = threading.Lock()
 _installed_signal_handlers: dict[signal.Signals, Any] = {}
 _console_ctrl_handler_ref: Any = None
 _console_ctrl_handler_installed = False
+
+
+class _DeprecatedStoreTrueAction(argparse.Action):
+    def __init__(
+        self,
+        option_strings: list[str],
+        dest: str,
+        *,
+        replacement: str,
+        **kwargs: Any,
+    ) -> None:
+        self.replacement = replacement
+        super().__init__(option_strings, dest, **kwargs)
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        option = option_string or self.option_strings[0]
+        print(f"{option} is deprecated; use {self.replacement}.", file=sys.stderr)
+        setattr(namespace, self.dest, True)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -46,20 +73,23 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--single-props-file",
         action="store_true",
         help=(
-            "Write repeated mesh prototypes to one props USD file instead of separate mesh USD files. "
-            "Does not merge meshes; use --merge-all-meshes."
+            "Store all mesh data in the exported scene instead of separate mesh files. "
+            "This disables USD scene instancing, does not merge meshes, and places copied textures "
+            "under materials/textures/ instead of textures/; use --merge-all-meshes."
         ),
     )
     parser.add_argument(
         "--single-mesh",
         dest="single_props_file",
-        action="store_true",
+        action=_DeprecatedStoreTrueAction,
+        nargs=0,
+        replacement="--single-props-file",
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--smooth-normals",
         action="store_true",
-        help="Generate smooth normals for meshes imported through Assimp only.",
+        help="Generate smooth normals for meshes without authored normals across all importers. Authored normals take precedence.",
     )
     parser.add_argument("--ignore-cameras", action="store_true", help="Do not export cameras.")
     parser.add_argument("--ignore-lights", action="store_true", help="Do not export lights.")
@@ -180,6 +210,16 @@ def _print_debug(args: argparse.Namespace, message: str) -> None:
         _safe_print(f"Debug: {message}", file=sys.stderr, flush=True)
 
 
+def _enable_faulthandler(args: argparse.Namespace) -> None:
+    try:
+        faulthandler.enable(file=sys.stderr)
+    except Exception:
+        try:
+            faulthandler.enable(file=sys.__stderr__)
+        except Exception:
+            _print_debug(args, "faulthandler unavailable for current stderr")
+
+
 def _status_name(status: object) -> str:
     return getattr(status, "name", str(status))
 
@@ -198,6 +238,19 @@ def _windows_trailing_space_or_dot_error(path: str) -> str | None:
     return None
 
 
+def _windows_max_path_error(path: str, kind: str = "output") -> str | None:
+    """Reject paths that leave no room for the Windows terminating null."""
+    if os.name != "nt":
+        return None
+    path_length = len(os.path.abspath(path).encode("utf-16-le")) // 2
+    if path_length >= _WINDOWS_MAX_PATH:
+        return (
+            f"Error: {kind} path exceeds the native converter Windows limit "
+            f"of {_WINDOWS_MAX_PATH - 1} characters (got {path_length})"
+        )
+    return None
+
+
 def _request_interrupt() -> None:
     """Mark interrupt requested. Safe from console-ctrl / signal threads.
 
@@ -206,7 +259,8 @@ def _request_interrupt() -> None:
     """
     global _interrupt_requested
     with _interrupt_lock:
-        _interrupt_requested = True
+        if not _success_committed:
+            _interrupt_requested = True
 
 
 def _install_posix_signal_handlers() -> None:
@@ -266,7 +320,7 @@ def _install_interrupt_handlers() -> None:
         _install_posix_signal_handlers()
 
 
-def _uninstall_interrupt_handlers() -> None:
+def _uninstall_interrupt_handlers(*, keep_windows_console_handler: bool = False) -> None:
     global _console_ctrl_handler_ref, _console_ctrl_handler_installed
 
     for sig, previous in list(_installed_signal_handlers.items()):
@@ -276,7 +330,12 @@ def _uninstall_interrupt_handlers() -> None:
             pass
     _installed_signal_handlers.clear()
 
-    if sys.platform == "win32" and _console_ctrl_handler_installed and _console_ctrl_handler_ref is not None:
+    if (
+        sys.platform == "win32"
+        and not keep_windows_console_handler
+        and _console_ctrl_handler_installed
+        and _console_ctrl_handler_ref is not None
+    ):
         import ctypes
 
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -299,20 +358,44 @@ async def _watch_for_interrupt(converter: Any) -> None:
         await asyncio.sleep(0.05)
 
 
-async def _convert(args: argparse.Namespace) -> int:
-    global _interrupt_requested
+@contextmanager
+def _output_commit_guard():
+    # POSIX signal handlers run on this thread: defer them while holding the
+    # lock. Windows console callbacks run on another thread and wait on it.
+    previous_mask = None
+    if hasattr(signal, "pthread_sigmask"):
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+    try:
+        with _interrupt_lock:
+            yield
+    finally:
+        if previous_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
+async def _convert(args: argparse.Namespace, keep_windows_console_handler_after_success: bool = False) -> int:
+    global _interrupt_requested, _success_committed
 
     if args.debug:
-        faulthandler.enable()
+        _enable_faulthandler(args)
         os.environ["OMNI_ASSET_CONVERTER_DEBUG"] = "1"
 
+    try:
+        # Windows can normalize DOS device names to device paths, hiding the
+        # original filename from validation. Reject them before abspath.
+        usdz._validate_output_path(Path(args.output))
+    except OSError as exc:
+        _safe_print(f"Error: cannot write output {args.output}: {exc}", file=sys.stderr)
+        return 1
+
     path_error = _windows_trailing_space_or_dot_error(args.output)
+    if not path_error:
+        path_error = _windows_max_path_error(args.output)
+    if not path_error:
+        path_error = _windows_max_path_error(args.input, "input")
     if path_error:
         _safe_print(path_error, file=sys.stderr)
         return 1
-
-    _print_debug(args, "importing asset_converter_native_bindings")
-    import asset_converter_native_bindings as assetconverter
 
     input_path = os.path.abspath(args.input)
     output_path = Path(os.path.abspath(args.output))
@@ -332,6 +415,16 @@ async def _convert(args: argparse.Namespace) -> int:
         )
         return 1
 
+    try:
+        # The backend sees a staging path, so it cannot validate this final destination.
+        usdz.preflight_output(output_path)
+    except OSError as exc:
+        _safe_print(f"Error: cannot write output {output_path}: {exc}", file=sys.stderr)
+        return 1
+
+    _print_debug(args, "importing asset_converter_native_bindings")
+    import asset_converter_native_bindings as assetconverter
+
     preview_surface = bool(getattr(args, "preview_surface", False))
     if is_usdz_output and not args.ignore_materials and not preview_surface and hasattr(args, "preview_surface"):
         preview_surface = True
@@ -340,26 +433,24 @@ async def _convert(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    output_dir = str(output_path.parent) if output_path.parent.parts else ""
-    if output_dir:
-        try:
-            os.makedirs(output_dir, exist_ok=True)
-        except OSError as exc:
-            _safe_print(f"Error: cannot create output directory {output_dir}: {exc}", file=sys.stderr)
-            return 1
-
     assetconverter.OmniAssetConverter.set_log_callback(_print_log)
     _print_debug(args, "native log callback registered")
 
     with _interrupt_lock:
         _interrupt_requested = False
+        _success_committed = False
 
     _install_interrupt_handlers()
     watch_task: asyncio.Task[None] | None = None
-    staging_context = usdz.temporary_staging_directory(output_path) if is_usdz_output else nullcontext(None)
+    success_committed = False
+    staging_context = usdz.temporary_staging_directory(output_path)
     try:
         with staging_context as staging_dir:
-            layer_output_path = usdz.staging_layer_path(staging_dir, output_path) if is_usdz_output else output_path
+            layer_output_path = (
+                usdz.staging_layer_path(staging_dir, output_path)
+                if is_usdz_output
+                else usdz.staging_output_path(staging_dir, output_path)
+            )
             _print_debug(args, f"layer output path: {layer_output_path}")
             _print_debug(args, "creating native conversion future")
             converter = assetconverter.OmniAssetConverter(
@@ -415,12 +506,35 @@ async def _convert(args: argparse.Namespace) -> int:
                         return 1
                     try:
                         _print_debug(args, f"packaging USDZ: {output_path}")
-                        usdz.package_usdz(layer_output_path, output_path)
+                        archive_path = usdz.staging_output_path(staging_dir, output_path)
+                        if archive_path.name == output_path.name:
+                            usdz.package_usdz(layer_output_path, archive_path)
+                        else:
+                            usdz.package_usdz(
+                                layer_output_path, archive_path, root_layer_name=f"{output_path.stem}.usdc"
+                            )
                     except usdz.UsdzError as exc:
                         _safe_print(f"Error: {exc}", file=sys.stderr)
                         return 1
 
-                _safe_print(f"Successfully converted: {output_path}")
+                # Make the final interrupt check and success commitment atomic.
+                # A later Windows console event must not invalidate this success.
+                with _output_commit_guard():
+                    interrupted = _interrupt_requested
+                    if not interrupted:
+                        usdz.commit_staged_files(
+                            staging_dir,
+                            output_path,
+                            archive=is_usdz_output,
+                            root_path=archive_path if is_usdz_output else layer_output_path,
+                        )
+                        _success_committed = True
+                        success_committed = True
+                if interrupted:
+                    _safe_print("Interrupted.", file=sys.stderr, flush=True)
+                    return _INTERRUPT_EXIT_CODE
+
+                _safe_print(f"Successfully converted: {output_path}", flush=True)
                 return 0
     finally:
         if watch_task is not None:
@@ -429,19 +543,26 @@ async def _convert(args: argparse.Namespace) -> int:
                 await watch_task
             except asyncio.CancelledError:
                 pass
-        _uninstall_interrupt_handlers()
+        _uninstall_interrupt_handlers(
+            keep_windows_console_handler=success_committed and keep_windows_console_handler_after_success
+        )
         try:
             assetconverter.OmniAssetConverter.shutdown()
         finally:
             assetconverter.OmniAssetConverter.set_log_callback(None)
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main(argv: list[str] | None, keep_windows_console_handler_after_success: bool) -> int:
     args = _parse_args(argv)
     if not _validate_formats(args):
         return 1
     try:
-        return asyncio.run(_convert(args))
+        return asyncio.run(
+            _convert(
+                args,
+                keep_windows_console_handler_after_success=keep_windows_console_handler_after_success,
+            )
+        )
     except KeyboardInterrupt:
         _request_interrupt()
         _safe_print("Interrupted.", file=sys.stderr, flush=True)
@@ -458,5 +579,22 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
+def main(argv: list[str] | None = None) -> int:
+    return _main(argv, keep_windows_console_handler_after_success=False)
+
+
+def process_main() -> int:
+    """Run the command-line process entry point."""
+    code = _main(None, keep_windows_console_handler_after_success=sys.platform == "win32")
+    if sys.platform == "win32" and _success_committed:
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+        os._exit(code)
+    return code
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(process_main())
